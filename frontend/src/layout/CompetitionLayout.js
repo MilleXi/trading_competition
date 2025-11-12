@@ -11,15 +11,11 @@ import StockTradeComponent from '../components/competition/StockTrade';
 import FinancialReport from '../components/competition/FinancialReport';
 import TradeHistory from '../components/competition/TradeHistory';
 import PointsStoreModal from '../components/competition/PointsStoreModal';
+import AIPrecomputeModal from '../components/competition/AIPrecomputeModal';
 import { v4 as uuidv4 } from 'uuid';
-import App from '../App';
-import zIndex from '@mui/material/styles/zIndex';
 import Box from '@mui/material/Box';
 import Checkbox from '@mui/material/Checkbox';
-import FormControl from '@mui/material/FormControl';
-import FormGroup from '@mui/material/FormGroup';
 import FormControlLabel from '@mui/material/FormControlLabel';
-import FormLabel from '@mui/material/FormLabel';
 import Grid from '@mui/material/Grid';
 import Typography from '@mui/material/Typography';
 import GameEndModal from '../components/competition/GameEndModal';
@@ -28,12 +24,11 @@ import { Button } from '@mui/material';
 
 const CompetitionLayout = () => {
   const initialBalance = 100000;
-  const [startDate, setStartDate] = useState(null); // 初始状态为 null
-  const gameIdRef = useRef(uuidv4());
-  const gameId = gameIdRef.current;
+  const [startDate, setStartDate] = useState(null);
+  const [gameId, setGameId] = useState(uuidv4());
   const [modelList, setModelList] = useState([]);
   const [currentRound, setCurrentRound] = useState(1);
-  const [currentDate, setCurrentDate] = useState(null); // 初始状态为 null
+  const [currentDate, setCurrentDate] = useState(null);
   const [selectedStock, setSelectedStock] = useState('AAPL');
   const [selectedStockList, setSelectedStockList] = useState(['AAPL', 'MSFT', 'GOOGL']);
   const [stockData, setStockData] = useState([]);
@@ -56,7 +51,7 @@ const CompetitionLayout = () => {
   const userId = 1;
   const [CandlestickChartData, setCandlestickChartData] = useState([]);
   const location = useLocation();
-  const { difficulty } = location.state || { difficulty: 'LSTM' };
+  const { difficulty } = location.state || { difficulty: 'PPOPlanning' };
   const rootElement = document.getElementById('root');
   const [aiStrategy, setAiStrategy] = useState({});
   const [showStrategyModal, setShowStrategyModal] = useState(false);
@@ -66,19 +61,26 @@ const CompetitionLayout = () => {
   const [userInfo, setUserInfo] = useState({});
   const [showGameEndModal, setShowGameEndModal] = useState(false);
 
+  // 新增: AI预计算相关状态
+  const [showAIPrecomputeModal, setShowAIPrecomputeModal] = useState(false);
+  const [aiPrecomputeComplete, setAiPrecomputeComplete] = useState(false);
+  const [gameCreated, setGameCreated] = useState(false);
+
   const handleClosePointsStore = () => setShowPointsStore(false);
   const handleShowPointsStore = () => setShowPointsStore(true);
 
   Modal.setAppElement(rootElement);
 
+  // 初始化交易日期
   useEffect(() => {
-    const randomDate = new Date(2023, 0, 1 + Math.floor(Math.random() * 300)); // 随机生成 2023-01-01 到 2023-12-01 之间的日期
-    console.log("Date::", randomDate)
+    const randomDate = new Date(2023, 0, 1 + Math.floor(Math.random() * 300));
+    console.log("Random Date:", randomDate);
+    
     const fetchTradingDay = async () => {
       try {
         const response = await axios.post('http://localhost:8000/api/next_trading_day', {
           current_date: randomDate.toISOString().split('T')[0],
-          n: 1 // 获取当前日期的交易日
+          n: 1
         });
         const tradingDay = new Date(response.data.next_trading_day);
         setStartDate(tradingDay);
@@ -89,12 +91,14 @@ const CompetitionLayout = () => {
     };
 
     fetchTradingDay();
-  }, []); // 仅在组件首次加载时调用一次
+  }, []);
 
+  // 设置modelList
   useEffect(() => {
     setModelList([difficulty]);
   }, [difficulty]);
 
+  // 获取股票数据
   useEffect(() => {
     const fetchStockData = async () => {
       try {
@@ -118,17 +122,16 @@ const CompetitionLayout = () => {
       }
     };
 
-    if (selectedStock && currentDate) { // 确保在 currentDate 已设置之后再调用
+    if (selectedStock && currentDate) {
       fetchStockData();
     }
   }, [selectedStock, currentDate]);
 
+  // 初始化游戏信息
   useEffect(() => {
-    console.log("StockData changed:", stockData);
-  }, [stockData]);
-
-  useEffect(() => {
-    if (!startDate) return; // 确保 startDate 已设置之后再初始化游戏信息
+    // 只有在AI预计算完成且游戏创建后才初始化
+    if (!startDate || !gameCreated) return;
+    
     const initializeGameInfo = async () => {
       try {
         const initialData = {
@@ -141,6 +144,7 @@ const CompetitionLayout = () => {
           score: 0
         };
         setUserInfo(initialData);
+        
         const aiData = {
           game_id: gameId,
           user_id: 'ai',
@@ -150,10 +154,10 @@ const CompetitionLayout = () => {
           stocks: {},
           score: 0
         };
+        
         await axios.post('http://localhost:8000/api/game_info', initialData);
         await axios.post('http://localhost:8000/api/game_info', aiData);
 
-        // 初始化交易记录
         const initialTransaction = {
           game_id: gameId,
           user_id: 'ai',
@@ -165,8 +169,7 @@ const CompetitionLayout = () => {
         };
         await saveTransaction(initialTransaction);
 
-        // 立即运行AI策略，确保有初始交易记录
-        await runAIStrategy();
+        console.log('✓ Game info initialized');
       } catch (error) {
         console.error('Error initializing game info:', error);
       }
@@ -174,10 +177,13 @@ const CompetitionLayout = () => {
 
     initializeGameInfo();
     fetchStockInfo();
-    console.log('initialize');
-  }, [startDate]);
+  }, [startDate, gameCreated]);
 
+  // 计时器
   useEffect(() => {
+    // 只有在AI预计算完成后才开始计时
+    if (!aiPrecomputeComplete) return;
+    
     const timerId = setTimeout(() => {
       if (counter > 0 && !stopCounter) {
         setCounter(counter - 1);
@@ -188,8 +194,16 @@ const CompetitionLayout = () => {
           handleNextRound();
       }
     }, 1000);
+    
     return () => clearTimeout(timerId);
-  }, [counter, gameEnd, stopCounter]);
+  }, [counter, gameEnd, stopCounter, aiPrecomputeComplete]);
+
+  // 获取股票信息
+  useEffect(() => {
+    if (currentDate && aiPrecomputeComplete) {
+      fetchStockInfo();
+    }
+  }, [currentDate, selectedTrades]);
 
   const tickers = [
     'AAPL', 'MSFT', 'GOOGL', 'AMZN', 'TSLA', 'JPM', 'BAC', 'C', 'WFC', 'GS',
@@ -218,34 +232,105 @@ const CompetitionLayout = () => {
   };
 
   const confirmSelection = async () => {
+    console.log('=== confirmSelection START ===');
+    console.log('selectedTickers:', selectedTickers);
+    console.log('difficulty:', difficulty);
+    
     if (selectedTickers.length === 3) {
+      // 更新选股状态
       setSelectedStockList(selectedTickers);
-      setSelectedStock(selectedTickers[0]); // 默认选择第一个股票
-      setStopCounter(false);
+      setSelectedStock(selectedTickers[0]);
+      setSelectedTrades(
+        selectedTickers.reduce((acc, stock) => 
+          ({ ...acc, [stock]: { type: 'hold', amount: '0' } }), {})
+      );
+      
+      // 关闭选股模态框
       closeModal();
-    } else
-      return;
-
-    try {
-      const response = await axios.post('http://localhost:8000/api/run_strategy', {
-        tickers: selectedTickers,
-        game_id: gameId,
-        start_test_date: currentDate
-      });
-      console.log('Strategy result:', response.data);
-
-      // 保存结果到数据库
-      for (const record of response.data.trade_log) {
-        const logEntry = {
-          ...record,
-          model: modelList[0],
-          game_id: gameId
-        };
-        await axios.post('http://localhost:8000/api/save_trade_log', logEntry);
+      
+      // 显示AI预计算进度模态框
+      setShowAIPrecomputeModal(true);
+      
+      // 检查必需数据
+      if (!startDate) {
+        console.error('❌ startDate is null');
+        alert('Error: Please wait for initialization to complete');
+        setShowAIPrecomputeModal(false);
+        return;
       }
+      
+      try {
+        const endDate = new Date(startDate.getTime() + 365 * 24 * 60 * 60 * 1000);
+        
+        // ✅ agent_type格式转换
+        const agentTypeMap = {
+          'ppoplanning': 'ppo_planning',
+          'hierarchical': 'hierarchical',
+          'riskconstrained': 'risk_constrained',
+          'llmreasoning': 'llm_reasoning',
+          'naive': 'naive'
+        };
+        
+        const normalizedDifficulty = difficulty.toLowerCase().replace(/\s+/g, '');
+        const agentType = agentTypeMap[normalizedDifficulty] || 'ppo_planning';
+        
+        console.log('Agent Type Mapping:', difficulty, '→', agentType);
+        
+        const gameData = {
+          player_name: "Player",
+          tickers: selectedTickers,
+          rounds: MaxRound,
+          start_cash: initialBalance,
+          agent_type: agentType,
+          start_date: startDate.toISOString().split('T')[0],
+          end_date: endDate.toISOString().split('T')[0]
+        };
+        
+        console.log('Creating game with data:', gameData);
+        
+        const response = await axios.post('http://localhost:8000/api/game/create', gameData);
+        
+        console.log('✓ Game created successfully:', response.data);
+        console.log('Game ID:', response.data.id);
+        setGameId(response.data.id);
+        // 模态框会自动轮询状态并在完成后关闭
+        
+      } catch (error) {
+        console.error('❌ Failed to create game:', error);
+        
+        if (error.response) {
+          console.error('Server error:', error.response.data);
+          alert(`Failed to create game: ${error.response.data.error || error.message}`);
+        } else {
+          alert(`Failed to create game: ${error.message}`);
+        }
+        
+        setShowAIPrecomputeModal(false);
+      }
+    } else {
+      alert('Please select exactly 3 stocks.');
+    }
+    
+    console.log('=== confirmSelection END ===');
+  };
 
-    } catch (error) {
-      console.error('Error running strategy:', error);
+  // AI预计算完成处理
+  const handleAIPrecomputeComplete = (status) => {
+    console.log('AI precompute completed:', status);
+    
+    if (status.status === 'completed') {
+      // 成功完成
+      setAiPrecomputeComplete(true);
+      setGameCreated(true);
+      setShowAIPrecomputeModal(false);
+      setStopCounter(false); // 开始游戏计时
+      
+      console.log('✓ Ready to start game');
+    } else if (status.status === 'failed') {
+      // 失败
+      console.error('AI precompute failed:', status.error);
+      alert('Failed to initialize AI opponent. Please try again.');
+      setShowAIPrecomputeModal(false);
     }
   };
 
@@ -259,10 +344,19 @@ const CompetitionLayout = () => {
   };
 
   const runAIStrategy = async () => {
+    // 只在AI预计算完成后才执行
+    if (!currentDate || !aiPrecomputeComplete) {
+      console.log('Waiting for AI precompute to complete...');
+      return;
+    }
+
     const date = currentDate.toISOString().split('T')[0];
     const aiInfo = await fetchAiInfo();
 
     try {
+      console.log('Loading AI strategy for date:', date);
+      
+      // 从数据库加载预计算的AI策略
       const aiResponse = await axios.get('http://localhost:8000/api/get_trade_log', {
         params: {
           game_id: gameId,
@@ -272,9 +366,9 @@ const CompetitionLayout = () => {
       });
 
       if (aiResponse.data) {
-        console.log("AI Strategy:", aiResponse.data);
+        console.log("✓ AI Strategy loaded:", aiResponse.data);
 
-        // 直接使用从后端获取的ai策略数据
+        // 使用从数据库获取的策略
         const strategy = aiResponse.data.change || {};
         if (Object.keys(strategy).length === 0) {
           selectedStockList.forEach(stock => {
@@ -282,6 +376,7 @@ const CompetitionLayout = () => {
           });
         }
 
+        // 执行AI交易
         for (const [stock, amount] of Object.entries(strategy)) {
           const response = await axios.get('http://localhost:8000/api/stored_stock_data', {
             params: {
@@ -298,7 +393,6 @@ const CompetitionLayout = () => {
           }
 
           const stockInfo = filteredData[0];
-          console.log("AI stockInfo:", stockInfo);
 
           const aiTransaction = {
             game_id: gameId,
@@ -312,15 +406,17 @@ const CompetitionLayout = () => {
 
           await saveTransaction(aiTransaction);
 
+          // 更新AI持仓
           if (amount > 0) {
             aiInfo.cash -= stockInfo.open * amount;
             aiInfo.stocks[stock] = (aiInfo.stocks[stock] || 0) + amount;
-          } else {
+          } else if (amount < 0) {
             aiInfo.cash += stockInfo.open * Math.abs(amount);
             aiInfo.stocks[stock] = (aiInfo.stocks[stock] || 0) - Math.abs(amount);
           }
         }
 
+        // 计算AI投资组合价值
         const aiPortfolioValue = await selectedStockList.reduce(async (accPromise, stock) => {
           const acc = await accPromise;
           const response = await axios.get('http://localhost:8000/api/stored_stock_data', {
@@ -344,16 +440,17 @@ const CompetitionLayout = () => {
         aiInfo.portfolio_value = aiPortfolioValue;
         aiInfo.total_assets = aiInfo.cash + aiInfo.portfolio_value;
 
+        // 更新AI信息
         try {
           await axios.post('http://localhost:8000/api/game_info', aiInfo);
         } catch (error) {
           console.error('Error updating AI info:', error);
         }
 
-        setAiStrategy(aiResponse.data); // 更新状态以触发其他依赖此状态的UI变化
+        setAiStrategy(aiResponse.data);
         setShowStrategyModal(true);
 
-        // 更新AI的状态
+        // 更新前端AI状态
         setAiCash(aiInfo.cash);
         setAiPortfolioValue(aiInfo.portfolio_value);
         setAiTotalAssets(aiInfo.total_assets);
@@ -362,23 +459,29 @@ const CompetitionLayout = () => {
       }
     } catch (error) {
       console.error('Error fetching AI strategy:', error);
+      
+      if (error.response && error.response.status === 404) {
+        console.warn('No AI strategy found for this date');
+      }
     }
   };
+
   const fetchStockInfo = async () => {
-    const date = currentDate.toISOString().split('T')[0]; // 确保date是一个字符串
+    if (!currentDate) return;
+    
+    const date = currentDate.toISOString().split('T')[0];
     let userInfo2 = await fetchUserInfo();
-    console.log("fetchStockInfo userInfo2:", userInfo2);
 
     if (!userInfo2) {
-      userInfo2 = userInfo
-      console.log("fetchUserinfo failed");
+      userInfo2 = userInfo;
+      console.log("fetchUserInfo failed, using cached userInfo");
       return;
     }
 
     const newStockInfo = {};
 
+    // 获取所有股票的当前价格
     for (const stock of Object.keys(selectedTrades)) {
-      console.log("useEffect stock:", stock);
       try {
         const response = await axios.get('http://localhost:8000/api/stored_stock_data', {
           params: {
@@ -399,16 +502,14 @@ const CompetitionLayout = () => {
     }
 
     setStockInfo(newStockInfo);
-    console.log("fetchStockInfo stockInfo:", newStockInfo);
 
     if (!userInfo2.stocks) {
       userInfo2.stocks = selectedStockList.reduce((acc, stock) => ({ ...acc, [stock]: 0 }), {});
     }
 
+    // 计算投资组合价值
     const portfolioValue = await selectedStockList.reduce(async (accPromise, stock) => {
       const acc = await accPromise;
-      console.log("stock", stock);
-      console.log("date", date);
       const response = await axios.get('http://localhost:8000/api/stored_stock_data', {
         params: {
           symbol: stock,
@@ -424,35 +525,24 @@ const CompetitionLayout = () => {
       }
 
       const stockInfo = filteredData[0];
-      console.log("stockInfo:", stockInfo);
       return acc + (userInfo2.stocks[stock] || 0) * stockInfo.close;
     }, Promise.resolve(0));
 
     userInfo2.portfolio_value = portfolioValue;
     userInfo2.total_assets = userInfo2.cash + userInfo2.portfolio_value;
 
-    // 更新前端显示的余额值
+    // 更新前端显示
     setCash(userInfo2.cash);
     setPortfolioValue(userInfo2.portfolio_value);
     setTotalAssets(userInfo2.total_assets);
     setUserInfo(userInfo2);
-    console.log('userinfo:', userInfo2);
-
-    console.log("fetchStockInfo userInfo:", userInfo2);
   };
 
-  useEffect(() => {
-    if (currentDate) {
-      console.log("useEffect currentDate:", currentDate);
-      fetchStockInfo();
-    }
-  }, [currentDate, selectedTrades]);
-
-
-
   const handleSubmit = async () => {
-    console.log('handleSubmit:');
+    console.log('handleSubmit');
     const userInfo2 = await fetchUserInfo();
+    
+    // 执行用户交易
     for (const [stock, { type, amount }] of Object.entries(selectedTrades)) {
       const transaction = {
         game_id: gameId,
@@ -466,6 +556,7 @@ const CompetitionLayout = () => {
 
       await saveTransaction(transaction);
 
+      // 更新用户持仓
       if (type === 'buy') {
         userInfo2.cash -= stockInfo[stock].open * amount;
         userInfo2.stocks[stock] = (userInfo2.stocks[stock] || 0) + parseFloat(amount);
@@ -475,34 +566,28 @@ const CompetitionLayout = () => {
       }
     }
 
-    console.log('submit userInfo2:', userInfo2);
-
-    // 先保存用户的game_info
+    // 保存用户信息
     try {
       await axios.post('http://localhost:8000/api/game_info', userInfo2);
     } catch (error) {
       console.error('Error updating user info:', error);
     }
 
-    // 保存AI的交易记录
+    // 加载并执行AI策略
     await runAIStrategy();
 
     setStopCounter(true);
-
   };
 
   const fetchUserInfo = async () => {
     try {
-      console.log("fetchUserInfo gameId:", gameId);
-      console.log("fetchUserInfo userId:", userId);
       const response = await axios.get('http://localhost:8000/api/game_info', {
         params: {
           game_id: gameId,
           user_id: userId
         }
       });
-      console.log("fetchUserInfo response:", response);
-      return response.data[0]; // 假设返回的第一个是需要的用户信息
+      return response.data[0];
     } catch (error) {
       console.error('Error fetching user info:', error);
       return null;
@@ -514,10 +599,10 @@ const CompetitionLayout = () => {
       const response = await axios.get('http://localhost:8000/api/game_info', {
         params: {
           game_id: gameId,
-          user_id: 'ai' // 假设AI用户ID为 'ai'
+          user_id: 'ai'
         }
       });
-      return response.data[0]; // 假设返回的第一个是需要的AI信息
+      return response.data[0];
     } catch (error) {
       console.error('Error fetching AI info:', error);
       return null;
@@ -525,8 +610,7 @@ const CompetitionLayout = () => {
   };
 
   const handleNextRound = async () => {
-    // 更新游戏日期逻辑，每次增加n个交易日
-    const n = 1; // 设定n为1个交易日
+    const n = 1;
     try {
       const response = await axios.post('http://localhost:8000/api/next_trading_day', {
         current_date: currentDate.toISOString().split('T')[0],
@@ -537,7 +621,7 @@ const CompetitionLayout = () => {
       if (currentRound === MaxRound) {
         setGameEnd(true);
         setStopCounter(true);
-        setShowGameEndModal(true); // 显示游戏结束的模态框
+        setShowGameEndModal(true);
         return;
       }
 
@@ -554,13 +638,13 @@ const CompetitionLayout = () => {
   const closeStrategyModal = () => {
     setShowStrategyModal(false);
     setSelectedTrades(selectedStockList.reduce((acc, stock) => ({ ...acc, [stock]: { type: 'hold', amount: '0' } }), {}));
-    setRefreshHistory(prev => !prev); // 触发交易历史刷新
+    setRefreshHistory(prev => !prev);
     handleNextRound();
     setStopCounter(false);
   };
 
   if (!currentDate) {
-    return <div>Loading...</div>; // 在 currentDate 未设置之前显示加载状态
+    return <div>Loading...</div>;
   }
 
   return (
@@ -589,7 +673,6 @@ const CompetitionLayout = () => {
               </CDropdownMenu>
             </CDropdown>
 
-            {/* Points Store Modal */}
             <PointsStoreModal show={showPointsStore} handleClose={handleClosePointsStore} />
           </div>
 
@@ -606,7 +689,8 @@ const CompetitionLayout = () => {
                 </div>
               </div>
               <div className="report" style={{ flex: "1", padding: '1em' }}>
-                <FinancialReport selectedStock={selectedStock}
+                <FinancialReport 
+                  selectedStock={selectedStock}
                   currentDate={currentDate}
                   stockData={stockData}
                   setStockData={setStockData}
@@ -621,7 +705,8 @@ const CompetitionLayout = () => {
                   rowGap={20}
                   colGap={5}
                   chartContainerHeight={300}
-                  rowsPerPage={5} />
+                  rowsPerPage={5} 
+                />
               </div>
             </div>
             <div className="bottom-section d-flex">
@@ -655,8 +740,6 @@ const CompetitionLayout = () => {
               </div>
             </div>
 
-
-
             <div className="history-section">
               <TradeHistory userId={userId} refreshHistory={refreshHistory} selectedStock={selectedStockList} gameId={gameId} />
             </div>
@@ -664,7 +747,11 @@ const CompetitionLayout = () => {
         </div>
       </div>
 
-      <Modal isOpen={isModalOpen} onRequestClose={closeModal} contentLabel="Select Stocks"
+      {/* 股票选择模态框 */}
+      <Modal 
+        isOpen={isModalOpen} 
+        onRequestClose={closeModal} 
+        contentLabel="Select Stocks"
         shouldCloseOnEsc={false}
         shouldCloseOnOverlayClick={false}
         style={{
@@ -710,34 +797,43 @@ const CompetitionLayout = () => {
         <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: '20px' }}>
           <Button
             onClick={confirmSelection}
+            disabled={selectedTickers.length !== 3}
             style={{
               padding: '10px 20px',
-              backgroundColor: '#008CBA',
+              backgroundColor: selectedTickers.length === 3 ? '#008CBA' : '#ccc',
               color: '#fff',
               border: 'none',
               borderRadius: '5px',
-              cursor: 'pointer',
+              cursor: selectedTickers.length === 3 ? 'pointer' : 'not-allowed',
               outline: 'none',
               fontSize: '20px'
             }}
           >
-            Confirm
+            Confirm {selectedTickers.length === 3 ? '' : `(${selectedTickers.length}/3)`}
           </Button>
         </div>
       </Modal>
 
+      {/* AI预计算进度模态框 */}
+      <AIPrecomputeModal
+        gameId={gameId}
+        agentName={difficulty}
+        visible={showAIPrecomputeModal}
+        onComplete={handleAIPrecomputeComplete}
+      />
 
+      {/* 策略显示模态框 */}
       <Modal
         isOpen={showStrategyModal}
         onRequestClose={closeStrategyModal}
         contentLabel="Strategy Modal"
         style={{
-            overlay: {
+          overlay: {
             backgroundColor: 'rgba(0, 0, 0, 0.7)',
             backdropFilter: 'blur(5px)',
             zIndex: '1000'
-            },
-            content: {
+          },
+          content: {
             top: '50%',
             left: '50%',
             right: 'auto',
@@ -753,36 +849,54 @@ const CompetitionLayout = () => {
             boxShadow: '0 4px 8px rgba(0, 0, 0, 0.2)',
             backgroundColor: '#fff',
             color: '#333',
-            textAlign: 'center' // 新增的样式
-            }
+            textAlign: 'center'
+          }
         }}
-        >
+      >
         <h2 style={{ textAlign: 'center', marginBottom: '20px' }}>
-            Strategy for {currentDate.toISOString().split('T')[0]}
+          Strategy for {currentDate.toISOString().split('T')[0]}
         </h2>
         <div style={{ marginBottom: '20px' }}>
-            <h3 style={{ marginBottom: '10px', color: '#444' }}>Player's Strategy:</h3>
-            {Object.entries(selectedTrades).map(([stock, trade]) => (
+          <h3 style={{ marginBottom: '10px', color: '#444' }}>Player's Strategy:</h3>
+          {Object.entries(selectedTrades).map(([stock, trade]) => (
             <div key={stock} style={{ marginBottom: '10px' }}>
-                <p>{stock}: {trade.type} {trade.amount}</p>
+              <p>{stock}: {trade.type} {trade.amount}</p>
             </div>
-            ))}
+          ))}
         </div>
         <div style={{ marginBottom: '20px' }}>
-            <h3 style={{ marginBottom: '10px', color: '#444' }}>AI's Strategy:</h3>
-            {aiStrategy && aiStrategy.change ? (
+          <h3 style={{ marginBottom: '10px', color: '#444' }}>AI's Strategy:</h3>
+          {aiStrategy && aiStrategy.change ? (
             Object.entries(aiStrategy.change).map(([stock, change]) => (
-                <div key={stock} style={{ marginBottom: '10px' }}>
+              <div key={stock} style={{ marginBottom: '10px' }}>
                 <p>{stock}: {change > 0 ? `buy ${change}` : (change === 0 ? `hold ${change}` : `sell ${Math.abs(change)}`)}</p>
-                </div>
+              </div>
             ))
-            ) : (
+          ) : (
             <p>No AI strategy found</p>
-            )}
+          )}
+          {aiStrategy && aiStrategy.rationale && (
+            <div
+              style={{
+                marginTop: '15px',
+                padding: '10px 12px',
+                backgroundColor: '#f5f5f5',
+                borderRadius: '8px',
+                textAlign: 'left',
+                maxHeight: '200px',
+                overflowY: 'auto',
+                whiteSpace: 'pre-wrap',
+              }}
+            >
+              <strong>AI Explanation:</strong>
+              <br />
+              {aiStrategy.rationale}
+            </div>
+          )}
         </div>
         <Button
-            onClick={closeStrategyModal}
-            style={{
+          onClick={closeStrategyModal}
+          style={{
             display: 'block',
             margin: '0 auto',
             padding: '10px 20px',
@@ -791,13 +905,14 @@ const CompetitionLayout = () => {
             backgroundColor: '#007bff',
             color: '#fff',
             cursor: 'pointer'
-            }}
-            variant='outlined'
+          }}
+          variant='outlined'
         >
-            Close
+          Close
         </Button>
       </Modal>
-      {/* Game End Modal */}
+
+      {/* 游戏结束模态框 */}
       <GameEndModal
         isOpen={showGameEndModal}
         onRequestClose={() => setShowGameEndModal(false)}
@@ -806,7 +921,7 @@ const CompetitionLayout = () => {
         userProfit={totalAssets - initialBalance}
         aiProfit={aiTotalAssets - initialBalance}
       />
-    </div >
+    </div>
   );
 }
 

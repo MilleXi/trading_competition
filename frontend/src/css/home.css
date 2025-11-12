@@ -69,7 +69,7 @@ body {
 
 .start-game-button,
 .difficulty-button {
-  font-size: 1.7rem; /* 按钮（包括字体）大小 */
+  font-size: 1.1rem; /* 按钮（包括字体）大小 */
   padding: 10px 30px; /* 调整按钮内边距（高度，宽度） */
   margin: 16px 40px; /* 调整按钮距离 */
   width: 180px; /* 设置固定宽度 */

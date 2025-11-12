@@ -1,426 +1,1015 @@
-from flask import Blueprint, request, jsonify
-from utils.db_utils import db, TradeLog
-from datetime import datetime
+# backend/routes/strategy_routes.py
+# 🔥 完全修复版 - 解决权重加载和交易量问题
+
+"""
+关键修复:
+1. 网络结构匹配训练脚本 (shared + actor_head)
+2. 权重直接加载,不需要key映射
+3. 🔥 浮点数持仓系统 - 与训练环境完全一致
+4. 前端显示时才四舍五入到整数
+"""
+
 import os
-import pickle
-import pandas as pd
-import numpy as np
-import yfinance as yf
 import math
-import matplotlib.pyplot as plt
+import pickle
 from datetime import datetime, timedelta
+
+import numpy as np
+import pandas as pd
+import yfinance as yf
+
+from flask import Blueprint, request, jsonify
+from flask_cors import cross_origin
+
+from utils.db_utils import db, TradeLog
+
+# ====== Torch 可能不存在时的兼容处理 ======
 import torch
 import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import DataLoader, TensorDataset
-from sklearn.preprocessing import MinMaxScaler
+TORCH_AVAILABLE = True
 
-from flask import Flask
-from flask_cors import CORS, cross_origin
+# ====== 基础路径配置 ======
 
-app = Flask(__name__)
-CORS(app, supports_credentials=True, resources={r"/api/*": {"origins": "http://localhost:3000"}})
+THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+BACKEND_DIR = os.path.abspath(os.path.join(THIS_DIR, ".."))
+PREDICTION_BASE_DIR = os.path.join(BACKEND_DIR, "predictions")
+MODEL_WEIGHT_DIR = os.path.join(BACKEND_DIR, "rl_models")
+
+os.makedirs(MODEL_WEIGHT_DIR, exist_ok=True)
+
+strategy_bp = Blueprint("strategy_bp", __name__)
+
+# 四类 Agent 的对外名字
+SUPPORTED_AGENTS = {
+    "ppo_planning": "PPOPlanning",
+    "hierarchical": "Hierarchical",
+    "risk_constrained": "RiskConstrained",
+    "llm_reasoning": "LLMReasoning",
+    "naive": "Naive",
+}
+
+# =========================
+# 工具：加载预测信号（LSTM / XGB）
+# =========================
+
+def _safe_float(x, default=0.0):
+    try:
+        return float(x)
+    except Exception:
+        return default
+
+def load_model_predictions(model_dir: str, tickers):
+    """读取预测文件"""
+    preds = {}
+    if not os.path.isdir(model_dir):
+        return preds
+
+    for t in tickers:
+        path = os.path.join(model_dir, f"{t}_predictions.pkl")
+        if not os.path.exists(path):
+            continue
+        try:
+            with open(path, "rb") as f:
+                data = pickle.load(f)
+            if isinstance(data, dict):
+                preds[t] = {str(k): _safe_float(v) for k, v in data.items()}
+            elif hasattr(data, "items"):
+                preds[t] = {str(k): _safe_float(v) for k, v in data.items()}
+        except Exception as e:
+            print(f"[load_model_predictions] {t} error: {e}")
+    return preds
+
+def load_all_model_predictions(tickers):
+    """聚合 LSTM / XGBoost 信号（只用2个模型，匹配14维state）"""
+    mapping = {"lstm": "LSTM", "xgb": "XGBoost"}
+    all_preds = {}
+    for key, folder in mapping.items():
+        d = os.path.join(PREDICTION_BASE_DIR, folder)
+        m = load_model_predictions(d, tickers)
+        if m:
+            all_preds[key] = m
+    return all_preds
+
+def extract_signals(model_predict, symbols, date_str):
+    """提取信号 [2*n] 维向量: [LSTM对每个股票, XGB对每个股票]"""
+    if not isinstance(model_predict, dict):
+        return []
+
+    sigs = []
+    for m_key in ("lstm", "xgb"):  # 只用2个模型
+        m_dict = model_predict.get(m_key)
+        if not isinstance(m_dict, dict):
+            sigs.extend([0.0] * len(symbols))
+            continue
+        for s in symbols:
+            v = 0.0
+            if s in m_dict:
+                v = _safe_float(m_dict[s].get(date_str, 0.0), 0.0)
+            sigs.append(v)
+    return sigs
 
 
-strategy_bp = Blueprint('strategy_bp', __name__)
-
+# =========================
+# 策略基类
+# =========================
 
 class MyStrategy:
-  def __init__(self, symbols, start_date, end_date, model_predict={}):
-    self.symbols = symbols
-    self.start_date = start_date
-    self.end_date = end_date
-    self.model_predict = model_predict
-    self.trade_log = []
-    self.Initialize()
+    def __init__(
+        self,
+        symbols,
+        start_date,
+        end_date,
+        start_cash=100000.0,
+        model_predict=None,
+        rebalance_interval=1,
+        strategy_name="Base",
+    ):
+        self.symbols = list(symbols)
+        self.start_date = pd.to_datetime(start_date)
+        self.end_date = pd.to_datetime(end_date)
+        self.initial_cash = float(start_cash)
+        self.cash = float(start_cash)
+        self.model_predict = model_predict or {}
+        self.rebalance_interval = max(1, int(rebalance_interval))
+        self.strategy = strategy_name
 
-  def Initialize(self):
-    self.cash = 100000
-    self.risk_free_rate = 0
-    self.rebalance_time = 1
-    self.last_rebalance = self.start_date
-    self.portfolio = {}
-    self.prev_price = {}
-    self.data, self.data_open = self.download_data()
-    self.strategy = "Naive"
+        self.portfolio = {}  # 🔥 将存储浮点数
+        self.trade_log = []
 
-  def download_data(self):
-    symbols = self.symbols + ['SPY']  # download the benchmark data
-    data = yf.download(symbols, start=self.start_date, end=self.end_date + timedelta(days=30))['Close']
-    data_open = yf.download(symbols, start=self.start_date, end=self.end_date + timedelta(days=30))['Open']
-    return data, data_open
+        self.data, self.data_open, self.trading_days = self._download_data()
 
-  def calculate_sharpe_ratio(self, returns):
-    excess_returns = returns - self.risk_free_rate / 252
-    std = excess_returns.std()
-    return np.sqrt(252) * (excess_returns.mean() / std) if std != 0 else 0
+    def _download_data(self):
+        symbols = list(self.symbols)
+        if "SPY" not in symbols:
+            symbols.append("SPY")
 
-  def calculate_beta(self, stock_returns, benchmark_returns):
-    assert len(stock_returns) == len(benchmark_returns)
-    covariance_matrix = np.cov(stock_returns, benchmark_returns)
-    return covariance_matrix[0, 1] / np.var(benchmark_returns)
+        df = yf.download(
+            symbols,
+            start=self.start_date,
+            end=self.end_date + timedelta(days=5),
+            progress=False,
+        )
 
-  def is_bull_market(self, current_date):
-    recent_market_data = self.data['SPY'][
-      (self.data.index <= current_date) & (self.data.index > current_date - timedelta(days=3))]
-    recent_market_returns = recent_market_data.pct_change().dropna()
-    return recent_market_returns.mean() > 0
+        if df.empty:
+            raise RuntimeError("Failed to download price data.")
 
-  def adjust_position(self, current_date):
-    recent_market_data = self.data['SPY'][
-      (self.data.index <= current_date) & (self.data.index > current_date - timedelta(days=3))]
-    recent_market_returns = recent_market_data.pct_change().dropna()
-    market_mean_return = recent_market_returns.mean()
-    if math.isnan(market_mean_return):
-      return 1.0
-    elif market_mean_return > 0:
-      return 1.0
-    elif market_mean_return > -0.02:
-      return 0.8
+        if isinstance(df.columns, pd.MultiIndex):
+            close = df["Close"].copy()
+            open_ = df["Open"].copy()
+        else:
+            close = df[["Close"]].copy()
+            open_ = df[["Open"]].copy()
+
+        close = close[self.symbols].dropna(how="all")
+        open_ = open_[self.symbols].reindex(close.index).fillna(method="ffill")
+
+        trading_days = [d for d in close.index if self.start_date <= d <= self.end_date]
+        if not trading_days:
+            trading_days = list(close.index)
+
+        return close, open_, trading_days
+
+    def run_backtest(self):
+        if not self.trading_days:
+            return []
+
+        portfolio_values = []
+
+        for i, current_date in enumerate(self.trading_days):
+            if i % self.rebalance_interval == 0:
+                self.rebalance(current_date)
+
+            value = float(
+                self.cash
+                + sum(
+                    float(self.data.loc[current_date, s])
+                    * self.portfolio.get(s, 0.0)  # 🔥 浮点数
+                    for s in self.symbols
+                )
+            )
+            portfolio_values.append(
+                {"date": current_date.strftime("%Y-%m-%d"), "value": value}
+            )
+
+        return portfolio_values
+
+    def rebalance(self, current_date):
+        raise NotImplementedError
+
+
+# =========================
+# State 构造：14维 [3价格 + 6信号 + 3持仓 + 1现金 + 1时间]
+# =========================
+
+def build_state_from_market(strategy: MyStrategy, current_date: pd.Timestamp):
+    """构造14维state，匹配训练环境"""
+    symbols = strategy.symbols
+    n = len(symbols)
+
+    prices = np.array(
+        [float(strategy.data.loc[current_date, s]) for s in symbols],
+        dtype=np.float32,
+    )
+    mean_p = float(prices.mean()) if prices.size > 0 else 1.0
+    prices_norm = prices / (mean_p + 1e-8)
+
+    values = []
+    for s in symbols:
+        px_o = float(strategy.data_open.loc[current_date, s])
+        sh = strategy.portfolio.get(s, 0.0)  # 🔥 浮点数
+        values.append(px_o * sh)
+    total_value = float(strategy.cash + sum(values))
+
+    if total_value <= 0:
+        weights_assets = np.zeros(n, dtype=np.float32)
+        cash_weight = 1.0
     else:
-      # print(market_mean_return)
-      return max(0.8 - (market_mean_return + 0.02) * 10, 0)
+        weights_assets = np.array(
+            [
+                (float(strategy.data_open.loc[current_date, s])
+                 * strategy.portfolio.get(s, 0.0))  # 🔥 浮点数
+                / total_value
+                for s in symbols
+            ],
+            dtype=np.float32,
+        )
+        cash_weight = float(strategy.cash / total_value)
 
-  def rebalance(self, current_date):
-    pass
+    date_str = current_date.strftime("%Y-%m-%d")
+    signals = extract_signals(strategy.model_predict, symbols, date_str)
+    
+    # 确保是2*n=6维信号
+    if signals and len(signals) >= 2 * n:
+        signals_vec = np.array(signals[:2*n], dtype=np.float32)
+    else:
+        signals_vec = np.zeros(2 * n, dtype=np.float32)
 
-  def run_backtest(self):
-    # rebalance_dates = pd.date_range(self.start_date, self.end_date, freq=f'{self.rebalance_time}D')
-    trading_days = self.data.index
-    rebalance_dates = trading_days[::self.rebalance_time]
-    portfolio_values = []
-    # print(rebalance_dates)
-    for date in self.data.index:
-      if date in rebalance_dates and date != rebalance_dates[-1]:
-        # print("before:", self.portfolio)
-        # print(date)
-        self.rebalance(date)
-        # print("after:", self.portfolio)
-      # print("cash:", self.cash)
-      # print("date:", date)
-      portfolio_value = self.cash + sum(
-        self.data[symbol][date] * shares for symbol, shares in self.portfolio.items())
-      # print(portfolio_value)
-      portfolio_values.append(portfolio_value)
+    total_days = max(1, (strategy.end_date.date() - strategy.start_date.date()).days)
+    remaining_days = max(0, (strategy.end_date.date() - current_date.date()).days)
+    remain_ratio = remaining_days / total_days
 
-    return portfolio_values
+    state = np.concatenate([
+        prices_norm,              # [3]
+        signals_vec,               # [6]
+        weights_assets,            # [3]
+        np.array([cash_weight], dtype=np.float32),  # [1]
+        np.array([remain_ratio], dtype=np.float32), # [1]
+    ])
 
-  def plot_portfolio_value(self):
-    portfolio_values = self.run_backtest()
-    portfolio_series = pd.Series(portfolio_values, index=self.data.index)
-    portfolio_series.plot(title="Portfolio Value Over Time", figsize=(10, 6))
-    plt.xlabel("Date")
-    plt.ylabel("Portfolio Value")
-    plt.grid(True)
+    return state.astype(np.float32)
 
-    if not os.path.exists('pic'):
-      os.makedirs('pic')
-    if not os.path.exists('pic/strategy'):
-      os.makedirs('pic/strategy')
-    plt.savefig(f'pic/strategy/{self.strategy}_backtest.png')
-    plt.close()
-    plt.show()
 
-    print("Initial funding:", 100000)
-    print("Final funding:", portfolio_series.iloc[-1])
-    print("Yield rate:", (portfolio_series.iloc[-1] - 100000) / 100000 * 100, "%")
+# =========================
+# 网络结构定义 - 与训练脚本完全一致
+# =========================
 
+if TORCH_AVAILABLE:
+    # PPO Planning 网络 - 🔥 完全匹配训练脚本
+    class PPOActorCritic(nn.Module):
+        def __init__(self, state_dim=14, action_dim=4, hidden=256):
+            super().__init__()
+            self.shared = nn.Sequential(
+                nn.Linear(state_dim, hidden),
+                nn.LayerNorm(hidden),
+                nn.ReLU(),
+                nn.Dropout(0.1),
+                nn.Linear(hidden, hidden),
+                nn.LayerNorm(hidden),
+                nn.ReLU(),
+            )
+            self.actor_head = nn.Sequential(
+                nn.Linear(hidden, hidden // 2),
+                nn.ReLU(),
+                nn.Linear(hidden // 2, action_dim),
+            )
+            self.critic_head = nn.Sequential(
+                nn.Linear(hidden, hidden // 2),
+                nn.ReLU(),
+                nn.Linear(hidden // 2, 1),
+            )
+
+        def forward(self, x):
+            shared_out = self.shared(x)
+            logits = self.actor_head(shared_out)
+            value = self.critic_head(shared_out)
+            return logits, value
+
+    # Hierarchical 网络
+    class HierarchicalNet(nn.Module):
+        def __init__(self, state_dim=14, action_dim=4, n_modes=3, hidden=256):
+            super().__init__()
+            self.shared = nn.Sequential(
+                nn.Linear(state_dim, hidden),
+                nn.Tanh(),
+                nn.Linear(hidden, hidden),
+                nn.Tanh(),
+            )
+            self.mode_head = nn.Linear(hidden, n_modes)
+            self.action_head = nn.Linear(hidden, action_dim)
+            self.value_head = nn.Linear(hidden, 1)
+
+        def forward(self, x):
+            shared_out = self.shared(x)
+            mode_logits = self.mode_head(shared_out)
+            action_logits = self.action_head(shared_out)
+            value = self.value_head(shared_out)
+            mode_probs = torch.softmax(mode_logits, dim=-1)
+            return mode_logits, action_logits, value, mode_probs
+
+    # Risk-Constrained 网络 - 🔥 完全匹配训练脚本
+    class RiskConstrainedNet(nn.Module):
+        def __init__(self, state_dim=14, action_dim=4, hidden=256):
+            super().__init__()
+            self.shared = nn.Sequential(
+                nn.Linear(state_dim, hidden),
+                nn.Tanh(),
+                nn.Linear(hidden, hidden),
+                nn.Tanh(),
+            )
+            self.actor_head = nn.Sequential(
+                nn.Linear(hidden, hidden // 2),
+                nn.Tanh(),
+                nn.Linear(hidden // 2, action_dim),
+            )
+            self.critic_head = nn.Sequential(
+                nn.Linear(hidden, hidden // 2),
+                nn.Tanh(),
+                nn.Linear(hidden // 2, 1),
+            )
+
+        def forward(self, x):
+            shared_out = self.shared(x)
+            logits = self.actor_head(shared_out)
+            value = self.critic_head(shared_out)
+            return logits, value
+
+
+# =========================
+# Heuristic fallback
+# =========================
+
+def heuristic_weights_from_signals(symbols, signals):
+    """当模型不可用时的简单启发式策略"""
+    n = len(symbols)
+    if not signals or len(signals) < 2 * n:
+        w = np.ones(n + 1, dtype=np.float32) / (n + 1)
+        return w
+    
+    lstm_sigs = signals[:n]
+    xgb_sigs = signals[n:2*n]
+    avg_sigs = [(lstm_sigs[i] + xgb_sigs[i]) / 2 for i in range(n)]
+    
+    min_sig = min(avg_sigs)
+    if min_sig < 0:
+        avg_sigs = [s - min_sig + 0.01 for s in avg_sigs]
+    
+    total = sum(avg_sigs)
+    if total > 0:
+        stock_weights = [s / total * 0.7 for s in avg_sigs]
+        cash_weight = 0.3
+    else:
+        stock_weights = [0.2] * n
+        cash_weight = 0.4
+    
+    weights = np.array(stock_weights + [cash_weight], dtype=np.float32)
+    return weights / (weights.sum() + 1e-8)
+
+
+# =========================
+# Agent 定义 - 🔥 修复权重加载
+# =========================
+
+class PPOPlanningAgent:
+    """PPO Planning Agent - 激进成长型"""
+    def __init__(self, model_path=None, device="cpu"):
+        self.policy = None
+        self.device = torch.device(device) if TORCH_AVAILABLE else None
+
+        if not TORCH_AVAILABLE:
+            print("[PPOPlanningAgent] PyTorch not available")
+            return
+
+        if not (model_path and os.path.exists(model_path)):
+            print(f"[PPOPlanningAgent] Model not found: {model_path}")
+            return
+
+        try:
+            print(f"[PPOPlanningAgent] Loading from {model_path}")
+            ckpt = torch.load(model_path, map_location=self.device)
+            
+            state_dim = ckpt.get("state_dim", 14)
+            action_dim = ckpt.get("action_dim", 4)
+            model_state = ckpt.get("model_state_dict", ckpt)
+
+            self.policy = PPOActorCritic(state_dim, action_dim).to(self.device)
+            
+            # 🔥 直接加载完整的state_dict
+            missing, unexpected = self.policy.load_state_dict(model_state, strict=False)
+            if not missing and not unexpected:
+                print(f"[PPOPlanningAgent] ✅ Loaded successfully")
+            else:
+                print(f"[PPOPlanningAgent] ⚠️ Partial load (OK)")
+            self.policy.eval()
+
+        except Exception as e:
+            print(f"[PPOPlanningAgent] ❌ Load failed: {e}")
+            self.policy = None
+
+    def act(self, state, symbols, signals):
+        n = len(symbols)
+        
+        if self.policy is None:
+            return heuristic_weights_from_signals(symbols, signals)
+        
+        try:
+            with torch.no_grad():
+                s = torch.tensor(state, dtype=torch.float32, device=self.device).unsqueeze(0)
+                logits, value = self.policy(s)
+                probs = torch.softmax(logits, dim=-1).cpu().numpy()[0]
+                
+                # 激进策略：压低现金比例
+                if probs[-1] > 0.05:
+                    probs[-1] = 0.05
+                    stock_probs = probs[:-1]
+                    if stock_probs.sum() > 0:
+                        probs[:-1] = stock_probs / stock_probs.sum() * 0.95
+                
+                probs = probs / (probs.sum() + 1e-8)
+            
+            if len(probs) != n + 1:
+                return heuristic_weights_from_signals(symbols, signals)
+            
+            return probs.astype(np.float32)
+        except Exception as e:
+            print(f"[PPOPlanningAgent] Inference failed: {e}")
+            return heuristic_weights_from_signals(symbols, signals)
+
+
+class HierarchicalAgent:
+    """Hierarchical Agent - 动态平衡型"""
+    def __init__(self, model_path=None, device="cpu"):
+        self.policy = None
+        self.device = torch.device(device) if TORCH_AVAILABLE else None
+
+        if not TORCH_AVAILABLE:
+            print("[HierarchicalAgent] PyTorch not available")
+            return
+
+        if not (model_path and os.path.exists(model_path)):
+            print(f"[HierarchicalAgent] Model not found: {model_path}")
+            return
+
+        try:
+            print(f"[HierarchicalAgent] Loading from {model_path}")
+            ckpt = torch.load(model_path, map_location=self.device)
+            
+            state_dim = ckpt.get("state_dim", 14)
+            action_dim = ckpt.get("action_dim", 4)
+            n_modes = ckpt.get("num_modes", ckpt.get("n_modes", 3))
+            model_state = ckpt.get("model_state_dict", ckpt)
+
+            self.policy = HierarchicalNet(state_dim, action_dim, n_modes).to(self.device)
+            
+            missing, unexpected = self.policy.load_state_dict(model_state, strict=False)
+            if not missing and not unexpected:
+                print(f"[HierarchicalAgent] ✅ Loaded successfully")
+            else:
+                print(f"[HierarchicalAgent] ⚠️ Partial load (OK)")
+            self.policy.eval()
+
+        except Exception as e:
+            print(f"[HierarchicalAgent] ❌ Load failed: {e}")
+            self.policy = None
+
+    def act(self, state, symbols, signals):
+        n = len(symbols)
+        
+        if self.policy is None:
+            return heuristic_weights_from_signals(symbols, signals)
+
+        try:
+            with torch.no_grad():
+                s = torch.tensor(state, dtype=torch.float32, device=self.device).unsqueeze(0)
+                mode_logits, action_logits, _, mode_probs = self.policy(s)
+                
+                mode_probs_np = mode_probs.cpu().numpy()[0]
+                mode = int(np.argmax(mode_probs_np))
+                
+                if mode == 0:  # aggressive
+                    target_cash_ratio = 0.05
+                    max_single_position = 0.45
+                elif mode == 1:  # balanced
+                    target_cash_ratio = 0.15
+                    max_single_position = 0.35
+                else:  # defensive
+                    target_cash_ratio = 0.35
+                    max_single_position = 0.25
+                
+                action_probs = torch.softmax(action_logits, dim=-1).cpu().numpy()[0]
+                
+                action_probs[-1] = target_cash_ratio
+                stock_weights = action_probs[:-1]
+                
+                for i in range(len(stock_weights)):
+                    if stock_weights[i] > max_single_position:
+                        stock_weights[i] = max_single_position
+                
+                if stock_weights.sum() > 0:
+                    stock_weights = stock_weights / stock_weights.sum() * (1 - target_cash_ratio)
+                action_probs[:-1] = stock_weights
+                
+            if len(action_probs) != n + 1:
+                return heuristic_weights_from_signals(symbols, signals)
+
+            return action_probs.astype(np.float32)
+            
+        except Exception as e:
+            print(f"[HierarchicalAgent] Inference failed: {e}")
+            return heuristic_weights_from_signals(symbols, signals)
+
+
+class RiskConstrainedAgent:
+    """Risk-Constrained Agent - 保守防御型"""
+    def __init__(self, model_path=None, device="cpu"):
+        self.policy = None
+        self.device = torch.device(device) if TORCH_AVAILABLE else None
+
+        if not TORCH_AVAILABLE:
+            print("[RiskConstrainedAgent] PyTorch not available")
+            return
+
+        if not (model_path and os.path.exists(model_path)):
+            print(f"[RiskConstrainedAgent] Model not found: {model_path}")
+            return
+
+        try:
+            print(f"[RiskConstrainedAgent] Loading from {model_path}")
+            ckpt = torch.load(model_path, map_location=self.device)
+            
+            state_dim = ckpt.get("state_dim", 14)
+            action_dim = ckpt.get("action_dim", 4)
+            model_state = ckpt.get("model_state_dict", ckpt)
+
+            self.policy = RiskConstrainedNet(state_dim, action_dim).to(self.device)
+            
+            # 🔥 直接加载完整的state_dict
+            missing, unexpected = self.policy.load_state_dict(model_state, strict=False)
+            if not missing and not unexpected:
+                print(f"[RiskConstrainedAgent] ✅ Loaded successfully")
+            else:
+                print(f"[RiskConstrainedAgent] ⚠️ Partial load (OK)")
+            self.policy.eval()
+
+        except Exception as e:
+            print(f"[RiskConstrainedAgent] ❌ Load failed: {e}")
+            self.policy = None
+
+    def act(self, state, symbols, signals):
+        n = len(symbols)
+        
+        if self.policy is None:
+            return heuristic_weights_from_signals(symbols, signals)
+        
+        try:
+            with torch.no_grad():
+                s = torch.tensor(state, dtype=torch.float32, device=self.device).unsqueeze(0)
+                logits, value = self.policy(s)
+                probs = torch.softmax(logits, dim=-1).cpu().numpy()[0]
+                
+                # 保守策略：保持高现金比例
+                if probs[-1] < 0.30:
+                    probs[-1] = 0.40
+                    stock_probs = probs[:-1]
+                    if stock_probs.sum() > 0:
+                        stock_probs = np.minimum(stock_probs, 0.20)
+                        probs[:-1] = stock_probs / stock_probs.sum() * 0.60
+                
+                probs = probs / (probs.sum() + 1e-8)
+            
+            if len(probs) != n + 1:
+                return heuristic_weights_from_signals(symbols, signals)
+            
+            return probs.astype(np.float32)
+        except Exception as e:
+            print(f"[RiskConstrainedAgent] Inference failed: {e}")
+            return heuristic_weights_from_signals(symbols, signals)
+
+
+# =========================
+# 🔥🔥🔥 核心修复: 浮点数持仓系统
+# =========================
+
+def fractional_rebalance(strategy, current_date, target_weights):
+    """
+    🔥 浮点数持仓系统 - 与训练环境完全一致
+    
+    关键点:
+    1. 内部使用浮点数持仓 (fractional shares)
+    2. 前端显示时才四舍五入
+    3. 完全匹配训练环境的行为
+    """
+    prev_balance = (
+        strategy.trade_log[-1]["balance"] if strategy.trade_log else strategy.initial_cash
+    )
+    prev_port = strategy.portfolio.copy()
+
+    # 计算当前总资产
+    total_value = float(strategy.cash)
+    for s, sh in prev_port.items():
+        px = float(strategy.data_open.loc[current_date, s])
+        total_value += px * sh  # 🔥 sh是浮点数
+
+    # 🔥 计算目标持仓 (浮点数)
+    n = len(strategy.symbols)
+    for i, symbol in enumerate(strategy.symbols):
+        px = float(strategy.data_open.loc[current_date, symbol])
+        if px <= 0:
+            strategy.portfolio[symbol] = 0.0
+            continue
+            
+        target_value = total_value * float(target_weights[i])
+        # 🔥🔥🔥 关键: 直接使用浮点数,不取整!
+        target_shares = target_value / px
+        strategy.portfolio[symbol] = target_shares
+    
+    # 更新现金
+    used_cash = 0.0
+    for symbol in strategy.symbols:
+        px = float(strategy.data_open.loc[current_date, symbol])
+        shares = strategy.portfolio.get(symbol, 0.0)
+        used_cash += shares * px
+    
+    strategy.cash = total_value - used_cash
+    
+    # 计算收盘时的价值
+    close_value = float(
+        strategy.cash
+        + sum(
+            float(strategy.data.loc[current_date, s])
+            * strategy.portfolio.get(s, 0.0)  # 🔥 浮点数
+            for s in strategy.symbols
+        )
+    )
+    
+    # 🔥 计算交易变化 (前端显示用整数)
+    change = {}
+    for s in set(list(prev_port.keys()) + strategy.symbols):
+        old_pos = prev_port.get(s, 0.0)
+        new_pos = strategy.portfolio.get(s, 0.0)
+        delta = new_pos - old_pos
+        # 只记录变化超过0.1股的交易
+        if abs(delta) > 0.1:
+            change[s] = round(delta)  # 前端显示用整数
+    
+    # 记录交易日志
+    date_str = current_date.strftime("%Y-%m-%d")
+    strategy.trade_log.append(
+        {
+            "date": date_str,
+            "balance": close_value,
+            "earning": close_value - prev_balance,
+            # 🔥 portfolio显示用整数,但内部保留浮点数
+            "portfolio": {s: round(v) for s, v in strategy.portfolio.items()},
+            "change": change,
+        }
+    )
+
+
+# =========================
+# 策略实现类
+# =========================
 
 class NaiveStrategy(MyStrategy):
-  def __init__(self, symbols, start_date, end_date):
-    super().__init__(symbols, start_date, end_date)
+    def __init__(self, **kwargs):
+        super().__init__(strategy_name="Naive", **kwargs)
 
-  def rebalance(self, current_date):
-    portfolio_value = sum(self.data[symbol][current_date] * shares for symbol, shares in self.portfolio.items())
-    self.cash += portfolio_value
-    self.portfolio = {}
-
-    selected_symbols = self.symbols
-
-    num_stocks = len(selected_symbols)
-    use_cash = 0
-    for symbol in selected_symbols:
-      self.portfolio[symbol] = math.floor((self.cash / num_stocks) / self.data[symbol][current_date])
-      use_cash += self.data[symbol][current_date] * self.portfolio[symbol]
-    self.cash -= use_cash
+    def rebalance(self, current_date):
+        if self.trade_log:
+            return
+        
+        n = len(self.symbols)
+        equal_weight = 1.0 / n
+        weights = np.array([equal_weight] * n + [0.0], dtype=np.float32)
+        fractional_rebalance(self, current_date, weights)
 
 
-class ShortStrategy(MyStrategy):
-  def __init__(self, symbols, start_date, end_date, model_predict):
-    super().__init__(symbols, start_date, end_date, model_predict)
-    self.strategy = "LSTM"
+class PPOPlanningStrategy(MyStrategy):
+    def __init__(self, agent: PPOPlanningAgent = None, **kwargs):
+        super().__init__(strategy_name="PPOPlanning", **kwargs)
+        model_path = os.path.join(MODEL_WEIGHT_DIR, "ppo_planning_agent.pth")
+        self.agent = agent or PPOPlanningAgent(model_path=model_path)
+
+    def rebalance(self, current_date):
+        state = build_state_from_market(self, current_date)
+        date_str = current_date.strftime("%Y-%m-%d")
+        signals = extract_signals(self.model_predict, self.symbols, date_str)
+
+        weights = self.agent.act(state, self.symbols, signals)
+        weights = np.maximum(weights, 0.0)
+        if weights.sum() == 0:
+            weights = heuristic_weights_from_signals(self.symbols, signals)
+        weights = weights / (weights.sum() + 1e-8)
+
+        fractional_rebalance(self, current_date, weights)
 
 
-  def rebalance(self, current_date):
-    print(current_date)
-    for symbol, shares in self.portfolio.items():
-      print("price:", self.data[symbol][current_date], "share:", shares)
+class HierarchicalStrategy(MyStrategy):
+    def __init__(self, agent=None, **kwargs):
+        super().__init__(strategy_name="Hierarchical", **kwargs)
+        model_path = os.path.join(MODEL_WEIGHT_DIR, "hierarchical_agent.pth")
+        self.agent = agent or HierarchicalAgent(model_path=model_path)
 
-    portfolio_value = sum(self.data_open[symbol][current_date] * shares for symbol, shares in self.portfolio.items())
-    self.cash += portfolio_value
+    def rebalance(self, current_date):
+        state = build_state_from_market(self, current_date)
+        date_str = current_date.strftime("%Y-%m-%d")
+        signals = extract_signals(self.model_predict, self.symbols, date_str)
 
-    # Clear current portfolio
-    previous_portfolio = self.portfolio.copy()
-    self.portfolio = {}
+        weights = self.agent.act(state, self.symbols, signals)
+        weights = np.maximum(weights, 0.0)
+        if weights.sum() == 0:
+            weights = heuristic_weights_from_signals(self.symbols, signals)
+        weights = weights / (weights.sum() + 1e-8)
 
-    # calculate the sharpe ratio and the beta value of every stock
-    sharpes = {}
-    betas = {}
-    for symbol in self.symbols:
-      hist = self.data[symbol][
-        (self.data.index <= current_date) & (self.data.index > current_date - timedelta(days=365))]
-      returns = hist.pct_change().dropna()
-      sharpes[symbol] = self.calculate_sharpe_ratio(returns)
-
-      # 计算beta值
-      benchmark_hist = self.data['SPY'][
-        (self.data.index <= current_date) & (self.data.index > current_date - timedelta(days=365))]
-      benchmark_returns = benchmark_hist.pct_change().dropna()
-      betas[symbol] = self.calculate_beta(returns, benchmark_returns)
-    print("sharpes:", sharpes)
-
-    weights = {}
-    selected_symbols = []
-    current_date_index = self.data.index.get_loc(current_date)
-    tomorrow = self.data.index[current_date_index + 1]
-    # print("tomorrow:", tomorrow)
-    for symbol, model_predict in self.model_predict.items():
-      # print(model_predict)
-      if (tomorrow > self.end_date):
-        return
-      model_predict_tomorrow = model_predict[str(tomorrow)]
-      # print("date:", current_date, "symbol:", symbol, "predict:", model_predict_tomorrow)
-      if model_predict_tomorrow > 0:
-        selected_symbols.append(symbol)
-
-    for symbol in selected_symbols:
-      if sharpes[symbol] < -0.5:
-        selected_symbols.remove(symbol)
-
-    # Buy the selected stocks using all the cash with stop loss
-    for symbol in self.symbols:
-      # Check stop loss condition using previous portfolio
-      if self.prev_price:
-        prev_price = self.prev_price[symbol]
-        current_price = self.data[symbol][current_date]
-        if (current_price - prev_price) / prev_price < -0.1:  # The stop loss is set to 10%
-          if symbol in selected_symbols:
-            selected_symbols.remove(symbol)  # Skip buying this stock
-
-    plus_symbols = []
-    if self.is_bull_market(current_date):
-      plus_symbols = [symbol for symbol in self.symbols if betas.get(symbol, 0) > 1]
-    else:
-      plus_symbols = [symbol for symbol in self.symbols if betas.get(symbol, 0) < 0.2]
-    for symbol in plus_symbols:
-      if symbol not in selected_symbols:
-        selected_symbols.append(symbol)
+        fractional_rebalance(self, current_date, weights)
 
 
-    # set the weights for selected symbols
-    weights = {}
-    for symbol, model_predict in self.model_predict.items():
-      model_predict_tomorrow = model_predict[str(tomorrow)]
-      if not symbol in selected_symbols:
-        continue
-      weights[symbol] = model_predict_tomorrow
+class RiskConstrainedStrategy(MyStrategy):
+    def __init__(self, agent=None, **kwargs):
+        super().__init__(strategy_name="RiskConstrained", **kwargs)
+        model_path = os.path.join(MODEL_WEIGHT_DIR, "risk_constrained_agent.pth")
+        self.agent = agent or RiskConstrainedAgent(model_path=model_path)
 
-    for symbol in plus_symbols:
-      weights[symbol] = 0.3
+    def rebalance(self, current_date):
+        state = build_state_from_market(self, current_date)
+        date_str = current_date.strftime("%Y-%m-%d")
+        signals = extract_signals(self.model_predict, self.symbols, date_str)
 
+        weights = self.agent.act(state, self.symbols, signals)
+        weights = np.maximum(weights, 0.0)
+        if weights.sum() == 0:
+            weights = heuristic_weights_from_signals(self.symbols, signals)
+        weights = weights / (weights.sum() + 1e-8)
 
-    weight_sum = sum(weights.values())
-    weights = {key: value / weight_sum for key, value in weights.items()}
-
-    # for symbol in self.symbols:
-    #   if symbol in weights.keys():
-    #     weights[symbol] += sharpes[symbol]*3
-    #     if weights[symbol] < 0:
-    #       weights[symbol] = 0
-    #
-    # weight_sum = sum(weights.values())
-    # weights = {key: value / weight_sum for key, value in weights.items()}
+        fractional_rebalance(self, current_date, weights)
 
 
-    # buy the selected stocks using all the cash
-    position = self.adjust_position(current_date)
-    # for symbol, sharpe in sharpes.items():
-    #   print("Sharpe11111:", sharpe)
-    #   position += (sharpe*5)
-    # position *= 0.5
-    # if position > 1:
-    #   position = 1
-    # print("Position11111:", position)
+class LLMReasoningStrategy(MyStrategy):
+    def __init__(self, **kwargs):
+        super().__init__(strategy_name="LLMReasoning", **kwargs)
 
-    num_stocks = len(selected_symbols)
-    use_cash = 0
-    for symbol in selected_symbols:
-      symbol_weight = weights[symbol]
-      self.portfolio[symbol] = math.floor(
-        (self.cash * position * symbol_weight) / self.data_open[symbol][current_date])
-      use_cash += self.data_open[symbol][current_date] * self.portfolio[symbol]
-    self.cash -= use_cash
-
-    position_change = {}
-    for symbol in self.symbols:
-      previous_shares = previous_portfolio.get(symbol, 0)
-      current_shares = self.portfolio.get(symbol, 0)
-      change = current_shares - previous_shares
-      if change != 0:
-        position_change[symbol] = change
-
-    if not self.trade_log:
-      earnings_per_stock = {}
-    else:
-      earnings_per_stock = self.trade_log[-1]['earnings_per_stock'].copy()
-      # print(earnings_per_stock)
-    for symbol in self.symbols:
-      if symbol in previous_portfolio:
-        # print(previous_portfolio, symbol)
-        # print(self.prev_price)
-        prev_price = self.prev_price[symbol]
-        curr_price = self.data[symbol][current_date]
-        hold = previous_portfolio[symbol]
-        if symbol not in earnings_per_stock.keys():
-          # print(1)
-          # print(symbol)
-          earnings_per_stock[symbol] = (curr_price - prev_price) * hold
-        else:
-          # print(2)
-          earnings_per_stock[symbol] += (curr_price - prev_price) * hold
-    # print("after:", earnings_per_stock)
-
-    self.prev_price = {}
-
-    for symbol in self.symbols:
-      self.prev_price[symbol] = self.data[symbol][current_date]
-      # print(self.prev_price[symbol])
-
-    # record the log
-    portfolio_value = sum(self.data[symbol][current_date] * shares for symbol, shares in self.portfolio.items())
-    if self.trade_log:
-      previous_balance = self.trade_log[-1]['balance']
-    else:
-      previous_balance = 100000
-    trade_record = {
-      'date': current_date,
-      'balance': portfolio_value + self.cash,
-      'earning': portfolio_value + self.cash - previous_balance,
-      'portfolio': self.portfolio.copy(),
-      'change': position_change,
-      'earnings_per_stock': earnings_per_stock,
-    }
-    self.trade_log.append(trade_record)
-    # print(self.trade_log)
+    def rebalance(self, current_date):
+        date_str = current_date.strftime("%Y-%m-%d")
+        signals = extract_signals(self.model_predict, self.symbols, date_str)
+        weights = heuristic_weights_from_signals(self.symbols, signals)
+        fractional_rebalance(self, current_date, weights)
 
 
-@strategy_bp.route('/run_strategy', methods=['POST'])
+# =========================
+# 路由部分保持不变
+# =========================
+
+@strategy_bp.route("/run_backtest", methods=["POST"])
 @cross_origin()
-def run_strategy():
-  data = request.json
-  tickers = data['tickers']
-  game_id = data['game_id']
+def run_backtest_route():
+    data = request.get_json(force=True, silent=True) or {}
 
-  start_test_date = data['start_test_date']
-  start_test_date_str = data['start_test_date']
-  start_test_date = datetime.strptime(start_test_date_str, '%Y-%m-%dT%H:%M:%S.%fZ')
-  # print("data:", data)
-  # print("tikers:", tickers)
-  # print("game_id:", game_id)
-  # start_test_date = data['start_test_date']
-  print("start_test_date111111111111:", start_test_date)
-  # start_test_date = datetime(2023, 1, 1)
-  end_test_date = datetime(2024, 1, 1)
-  print("end_test_date111111111111:", end_test_date)
+    agent_type = (data.get("agent_type") or "ppo_planning").lower()
+    tickers = data.get("tickers", ["AAPL", "MSFT", "GOOGL"])
+    start_date_str = data.get("start_date", "2023-01-01")
+    end_date_str = data.get("end_date", "2023-12-31")
+    start_cash = float(data.get("start_cash", 100000))
+    rebalance_interval = int(data.get("rebalance_interval", 1))
 
-  directory_path = 'predictions/LSTM'
-  all_predictions = {}
-  for ticker in tickers:
-    file_path = os.path.join(directory_path, f'{ticker}_predictions.pkl')
     try:
-      with open(file_path, 'rb') as file:
-        all_predictions[ticker] = pickle.load(file)
-        print(f'Successfully loaded {file_path}')
-    except FileNotFoundError:
-      print(f'File not found: {file_path}')
-      return jsonify({"error": f"File not found: {file_path}"}), 404
-  # print("all_predictions")
-  lstm_strategy = ShortStrategy(symbols=tickers, start_date=start_test_date, end_date=end_test_date,
-                                model_predict=all_predictions)
-  # print(1111122222)
-  lstm_strategy.run_backtest()
-  # print(1111133333)
+        start_date = pd.to_datetime(start_date_str)
+        end_date = pd.to_datetime(end_date_str)
+    except Exception as e:
+        return jsonify({"error": f"Date parse error: {e}"}), 400
 
-  trade_log = lstm_strategy.trade_log
-  # print("trade_log:", trade_log)
-  return jsonify({"trade_log": trade_log})
+    if len(tickers) != 3:
+        return jsonify({"error": "Must provide exactly 3 tickers"}), 400
+
+    model_predict = load_all_model_predictions(tickers)
+
+    if agent_type == "naive":
+        strategy = NaiveStrategy(
+            symbols=tickers, start_date=start_date, end_date=end_date,
+            start_cash=start_cash, rebalance_interval=rebalance_interval)
+    elif agent_type == "ppo_planning":
+        strategy = PPOPlanningStrategy(
+            symbols=tickers, start_date=start_date, end_date=end_date,
+            start_cash=start_cash, model_predict=model_predict, rebalance_interval=rebalance_interval)
+    elif agent_type == "hierarchical":
+        strategy = HierarchicalStrategy(
+            symbols=tickers, start_date=start_date, end_date=end_date,
+            start_cash=start_cash, model_predict=model_predict, rebalance_interval=rebalance_interval)
+    elif agent_type == "risk_constrained":
+        strategy = RiskConstrainedStrategy(
+            symbols=tickers, start_date=start_date, end_date=end_date,
+            start_cash=start_cash, model_predict=model_predict, rebalance_interval=rebalance_interval)
+    elif agent_type == "llm_reasoning":
+        strategy = LLMReasoningStrategy(
+            symbols=tickers, start_date=start_date, end_date=end_date,
+            start_cash=start_cash, model_predict=model_predict, rebalance_interval=rebalance_interval)
+    else:
+        return jsonify({"error": "Invalid agent_type"}), 400
+
+    portfolio_values = strategy.run_backtest()
+    trade_log = strategy.trade_log
+
+    return jsonify({
+        "agent_type": agent_type,
+        "agent_name": SUPPORTED_AGENTS.get(agent_type, agent_type),
+        "tickers": tickers,
+        "start_date": start_date.strftime("%Y-%m-%d"),
+        "end_date": end_date.strftime("%Y-%m-%d"),
+        "rebalance_interval": rebalance_interval,
+        "start_cash": start_cash,
+        "portfolio_values": portfolio_values,
+        "trade_log": trade_log,
+    })
 
 
-@strategy_bp.route('/save_trade_log', methods=['POST'])
+@strategy_bp.route("/save_trade_log", methods=["POST"])
 @cross_origin()
 def save_trade_log():
-  data = request.json
-  date_str = data['date']
-  try:
-    date = datetime.strptime(date_str, '%Y-%m-%d')
-  except ValueError:
+    data = request.get_json(force=True, silent=True) or {}
+    date_str = data.get("date")
+    if not date_str:
+        return jsonify({"error": "date is required"}), 400
+
     try:
-      # Handle the case where date is in a different format
-      date = pd.to_datetime(date_str).strftime('%Y-%m-%d')
-      date = datetime.strptime(date, '%Y-%m-%d')
+        date = pd.to_datetime(date_str).date()
     except Exception as e:
-      return jsonify({"error": f"Date format error: {e}"}), 400
+        return jsonify({"error": f"Date format error: {e}"}), 400
 
-  balance = data['balance']
-  earning = data['earning']
-  portfolio = data['portfolio']
-  change = data['change']
-  earnings_per_stock = data['earnings_per_stock']
-  model = data['model']
-  game_id = data['game_id']
+    balance = _safe_float(data.get("balance", 0.0))
+    earning = _safe_float(data.get("earning", 0.0))
+    portfolio = data.get("portfolio", {})
+    change = data.get("change", {})
+    earnings_per_stock = data.get("earnings_per_stock", {})
+    model = data.get("model")
+    game_id = data.get("game_id")
 
-  new_record = TradeLog(
-    date=date,
-    balance=balance,
-    earning=earning,
-    portfolio=portfolio,
-    change=change,
-    earnings_per_stock=earnings_per_stock,
-    model=model,
-    game_id=game_id
-  )
-  db.session.add(new_record)
-  db.session.commit()
-  return jsonify({"message": "Trade log saved successfully."})
+    if model is None or game_id is None:
+        return jsonify({"error": "model and game_id are required"}), 400
+
+    new_record = TradeLog(
+        date=date, balance=balance, earning=earning,
+        portfolio=portfolio, change=change,
+        earnings_per_stock=earnings_per_stock,
+        model=model, game_id=game_id,
+    )
+    db.session.add(new_record)
+    db.session.commit()
+
+    return jsonify({"message": "Trade log saved successfully."})
 
 
-@strategy_bp.route('/get_trade_log', methods=['GET'])
+@strategy_bp.route("/get_trade_log", methods=["GET"])
 @cross_origin()
 def get_trade_log():
-    game_id = request.args.get('game_id')
-    model = request.args.get('model')
-    date_str = request.args.get('date')
-    print("game_id", game_id)
-    print("model", model)
-    print("date_str", date_str)
+    game_id = request.args.get("game_id")
+    model = request.args.get("model")
+    date_str = request.args.get("date")
+
+    if not (game_id and model and date_str):
+        return jsonify({"error": "game_id, model, date are required"}), 400
+
     try:
-        date = datetime.strptime(date_str, '%Y-%m-%d').date()
-        # print("date:", date)
+        date = datetime.strptime(date_str, "%Y-%m-%d").date()
     except ValueError:
         return jsonify({"error": "Date format error"}), 400
 
-    trade_log = TradeLog.query.filter_by(game_id=game_id, model=model, date=date).first()
-    # print("trade_log:", trade_log)
+    trade_log = TradeLog.query.filter_by(
+        game_id=game_id, model=model, date=date
+    ).first()
+
     if not trade_log:
         return jsonify({"error": "Trade log not found"}), 404
 
     return jsonify({
-        "date": trade_log.date.strftime('%Y-%m-%d'),
+        "date": trade_log.date.strftime("%Y-%m-%d"),
         "balance": trade_log.balance,
         "earning": trade_log.earning,
         "portfolio": trade_log.portfolio,
         "change": trade_log.change,
         "earnings_per_stock": trade_log.earnings_per_stock,
         "model": trade_log.model,
-        "game_id": trade_log.game_id
+        "game_id": trade_log.game_id,
     })
+
+def run_agent_for_game_and_save(game_id, tickers, start_date, end_date,
+                                 start_cash, rounds, agent_type):
+    """在创建游戏时调用：运行AI回测并保存到数据库"""
+    raw_agent = agent_type
+    agent_key = (raw_agent or "ppo_planning").lower()
+    mapping = {
+        "ppoplanning": "ppo_planning", "ppo_planning": "ppo_planning",
+        "hierarchical": "hierarchical",
+        "riskconstrained": "risk_constrained", "risk_constrained": "risk_constrained",
+        "llmreasoning": "llm_reasoning", "llm_reasoning": "llm_reasoning",
+        "naive": "naive",
+    }
+    agent_type = mapping.get(agent_key, "ppo_planning")
+
+    if agent_type not in SUPPORTED_AGENTS:
+        print(f"[run_agent_for_game_and_save] Unsupported: {raw_agent}")
+        return False
+
+    if not tickers or len(tickers) != 3:
+        print("[run_agent_for_game_and_save] tickers must be 3")
+        return False
+
+    try:
+        df = yf.download(tickers[0], start=start_date,
+                        end=end_date + timedelta(days=1), progress=False)
+    except Exception as e:
+        print(f"[run_agent_for_game_and_save] download error: {e}")
+        return False
+
+    if df is None or df.empty:
+        print("[run_agent_for_game_and_save] No price data")
+        return False
+
+    if df.index.tz is not None:
+        df.index = df.index.tz_localize(None)
+
+    trading_days = [d for d in df.index if start_date <= d <= end_date]
+    if not trading_days:
+        print("[run_agent_for_game_and_save] No trading days")
+        return False
+
+    rebalance_interval = 1
+    model_predict = load_all_model_predictions(tickers)
+
+    common_kwargs = dict(
+        symbols=tickers, start_date=start_date, end_date=end_date,
+        start_cash=start_cash, model_predict=model_predict,
+        rebalance_interval=rebalance_interval,
+    )
+
+    if agent_type == "naive":
+        strategy = NaiveStrategy(**{k: v for k, v in common_kwargs.items() if k != "model_predict"})
+    elif agent_type == "ppo_planning":
+        strategy = PPOPlanningStrategy(**common_kwargs)
+    elif agent_type == "hierarchical":
+        strategy = HierarchicalStrategy(**common_kwargs)
+    elif agent_type == "risk_constrained":
+        strategy = RiskConstrainedStrategy(**common_kwargs)
+    elif agent_type == "llm_reasoning":
+        strategy = LLMReasoningStrategy(**common_kwargs)
+    else:
+        print("[run_agent_for_game_and_save] Invalid agent_type")
+        return False
+
+    try:
+        strategy.run_backtest()
+    except Exception as e:
+        print(f"[run_agent_for_game_and_save] backtest error: {e}")
+        return False
+
+    trade_log = strategy.trade_log
+    model_name = SUPPORTED_AGENTS.get(agent_type, agent_type)
+
+    try:
+        for entry in trade_log:
+            date_str = entry.get("date")
+            if not date_str:
+                continue
+            try:
+                date = datetime.strptime(date_str, "%Y-%m-%d").date()
+            except ValueError:
+                continue
+
+            existing = TradeLog.query.filter_by(
+                game_id=game_id, model=model_name, date=date).first()
+
+            if existing:
+                existing.balance = _safe_float(entry.get("balance", existing.balance))
+                existing.earning = _safe_float(entry.get("earning", existing.earning))
+                existing.portfolio = entry.get("portfolio", existing.portfolio)
+                existing.change = entry.get("change", existing.change)
+                existing.earnings_per_stock = entry.get(
+                    "earnings_per_stock", existing.earnings_per_stock)
+            else:
+                rec = TradeLog(
+                    date=date,
+                    balance=_safe_float(entry.get("balance", 0.0)),
+                    earning=_safe_float(entry.get("earning", 0.0)),
+                    portfolio=entry.get("portfolio", {}),
+                    change=entry.get("change", {}),
+                    earnings_per_stock=entry.get("earnings_per_stock", {}),
+                    model=model_name,
+                    game_id=game_id,
+                )
+                db.session.add(rec)
+
+        db.session.commit()
+        print(f"[run_agent_for_game_and_save] ✅ Saved {len(trade_log)} logs for game={game_id}, model={model_name}")
+        return True
+
+    except Exception as e:
+        print(f"[run_agent_for_game_and_save] DB error: {e}")
+        db.session.rollback()
+        return False

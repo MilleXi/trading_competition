@@ -67,6 +67,7 @@ class TradeLog(db.Model):
     earnings_per_stock = db.Column(db.PickleType, nullable=False)
     model = db.Column(db.String(50), nullable=False)
     game_id = db.Column(db.Integer, nullable=False)
+    reasoning = db.Column(db.String(500), nullable=False)
 
 
 def init_db(app):

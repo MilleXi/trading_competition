@@ -21,7 +21,7 @@ import {
 
 const HomeLayout = () => {
   const [difficultyModalVisible, setDifficultyModalVisible] = useState(false);
-  const [difficulty, setDifficulty] = useState('LSTM');
+  const [difficulty, setDifficulty] = useState('PPOPlanning');
   const navigate = useNavigate();
 
   const startGame = () => {
@@ -30,8 +30,8 @@ const HomeLayout = () => {
   }
 
   // 将状态提升到父组件，以便在点击按钮时更新状态
-  const handleDifficultyClick = (difficulty) => {
-    setDifficulty(difficulty);
+  const handleDifficultyClick = (d) => {
+    setDifficulty(d);
     setDifficultyModalVisible(false);
   };
 
