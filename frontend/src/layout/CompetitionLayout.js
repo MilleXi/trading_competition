@@ -260,7 +260,6 @@ const CompetitionLayout = () => {
       }
       
       try {
-        const endDate = new Date(startDate.getTime() + 365 * 24 * 60 * 60 * 1000);
         
         // ✅ agent_type格式转换
         const agentTypeMap = {
@@ -270,7 +269,20 @@ const CompetitionLayout = () => {
           'llmreasoning': 'llm_reasoning',
           'naive': 'naive'
         };
-        
+        const calculateEndDate = async (start, rounds) => {
+          try {
+            const response = await axios.post('http://localhost:8000/api/next_trading_day', {
+              current_date: start.toISOString().split('T')[0],
+              n: rounds
+            });
+            return new Date(response.data.next_trading_day);
+          } catch (error) {
+            console.error('Error calculating end date:', error);
+            // Fallback: 估算 20 个日历日
+            return new Date(start.getTime() + 20 * 24 * 60 * 60 * 1000);
+          }
+        };
+        const endDate = await calculateEndDate(startDate, MaxRound);
         const normalizedDifficulty = difficulty.toLowerCase().replace(/\s+/g, '');
         const agentType = agentTypeMap[normalizedDifficulty] || 'ppo_planning';
         
@@ -741,7 +753,13 @@ const CompetitionLayout = () => {
             </div>
 
             <div className="history-section">
-              <TradeHistory userId={userId} refreshHistory={refreshHistory} selectedStock={selectedStockList} gameId={gameId} />
+              <TradeHistory 
+                userId={userId} 
+                refreshHistory={refreshHistory} 
+                selectedStock={selectedStockList} 
+                gameId={gameId}
+                agentType={difficulty}
+              />
             </div>
           </div>
         </div>

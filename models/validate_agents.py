@@ -39,7 +39,42 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 TEST_TICKERS = ['AAPL', 'MSFT', 'GOOGL']
 TEST_START = "2023-01-01"
 TEST_END = "2024-01-01"
+import json
+from hashlib import md5
 
+def _print_progress(i, n, prefix="LLM", bar_len=30):
+    ratio = i / max(1, n)
+    done = int(ratio * bar_len)
+    bar = "█" * done + "-" * (bar_len - done)
+    end = "" if i < n else "\n"
+    print(f"\r{prefix} [{bar}] {i}/{n}", end=end, flush=True)
+
+def _llm_cache_filename(base_dir, tickers, start, end, initial_cash, fee_rate, temperature, model_name):
+    tag = {
+        "tickers": list(tickers),
+        "start": str(start),
+        "end": str(end),
+        "cash": float(initial_cash),
+        "fee": float(fee_rate),
+        "temp": float(temperature),
+        "model": str(model_name),
+    }
+    sig = md5(json.dumps(tag, sort_keys=True).encode()).hexdigest()[:10]
+    fname = f"llm_decisions_{sig}.json"
+    return os.path.join(base_dir, fname)
+
+def _save_llm_cache(path, meta, daily_records):
+    payload = {"meta": meta, "records": daily_records}
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+
+def _load_llm_cache(path):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data.get("meta", {}), data.get("records", [])
+    except Exception:
+        return None, None
 
 def _pretty_title():
     print("=" * 80)
@@ -388,6 +423,241 @@ def run_backtest(agent_name, network, env_class, price_df, tickers, model_predic
         "modes_history": modes_history if "Hierarchical" in agent_name else None,
     }
     return result
+# ============== LLM Agent 回测（独立于 RL env） ==============
+import time
+from datetime import datetime as _dt
+
+def _apply_trades_llm(current_prices, trades, positions, cash, fee_rate=0.0005):
+    """
+    根据 LLM 的 trades 指令执行交易，返回更新后的 (positions, cash)。
+    trades 形如: {"AAPL": {"action":"buy","shares":10}, ...}
+    自动约束：现金不足不买、持仓不足不卖。
+    """
+    for sym, instr in trades.items():
+        price = float(current_prices.get(sym, 0.0))
+        if price <= 0:
+            continue
+        action = str(instr.get("action", "hold")).lower()
+        qty = float(instr.get("shares", 0.0))
+        if qty <= 0 or action == "hold":
+            continue
+
+        if action == "buy":
+            # 以现金为约束，计算最多能买的股数
+            max_shares = int(cash // (price * (1 + fee_rate)))
+            buy_qty = int(min(qty, max_shares))
+            if buy_qty > 0:
+                cost = buy_qty * price
+                fee = cost * fee_rate
+                cash -= (cost + fee)
+                positions[sym] = positions.get(sym, 0.0) + buy_qty
+
+        elif action == "sell":
+            # 以持仓为约束，不能卖超过现有持仓
+            hold_qty = int(positions.get(sym, 0.0))
+            sell_qty = int(min(qty, hold_qty))
+            if sell_qty > 0:
+                proceeds = sell_qty * price
+                fee = proceeds * fee_rate
+                cash += (proceeds - fee)
+                positions[sym] = hold_qty - sell_qty
+
+    return positions, cash
+
+
+def run_backtest_llm(agent, price_df, tickers, initial_cash=100000.0,
+                     signals=None, market_ctx=None,
+                     fee_rate=0.0005, rpm_limit=60, sleep_sec=1.1):
+    """
+    支持磁盘缓存与进度条的 LLM 回测。
+    - 首次运行：逐日调用 API，显示进度条，并把每日决策写入 rl_models/ 缓存文件
+    - 之后运行：命中相同签名的缓存时，不再调 API，直接加载决策，秒跑
+    """
+    print("\n📈 Testing LLM Reasoning Agent (per-day API calls with disk cache)...")
+    prices = price_df.copy()
+    dates = list(prices.index)
+    positions = {sym: 0.0 for sym in tickers}
+    cash = float(initial_cash)
+    portfolio_values, cash_ratios, turnovers = [cash], [], []
+    drawdown_history, returns, positions_history = [], [], []
+    actions_history = []
+    peak_value = cash
+    dd_in, dd_len, dd_len_max = False, 0, 0
+
+    # —— 缓存路径 & 元信息
+    start_date = dates[0]
+    end_date = dates[-1]
+    cache_path = _llm_cache_filename(
+        base_dir=MODEL_DIR,
+        tickers=tickers,
+        start=start_date, end=end_date,
+        initial_cash=initial_cash, fee_rate=fee_rate,
+        temperature=getattr(agent, "temperature", 0.0),
+        model_name=getattr(agent, "model_name", "gpt-4o"),
+    )
+    cache_meta = {
+        "tickers": list(tickers),
+        "start": str(start_date),
+        "end": str(end_date),
+        "initial_cash": initial_cash,
+        "fee_rate": fee_rate,
+        "temperature": getattr(agent, "temperature", 0.0),
+        "model_name": getattr(agent, "model_name", "gpt-4o"),
+    }
+
+    # —— 优先尝试读取缓存（若命中则不调 API）
+    daily_records = []
+    meta0, rec0 = _load_llm_cache(cache_path)
+    if meta0 and rec0:
+        print(f"⚡ Using cached LLM decisions: {cache_path}")
+        daily_records = rec0
+        # 校验记录长度与日期对齐（简单校验）
+        if len(daily_records) != len(dates) - 1:
+            print("⚠ Cache length mismatch; will ignore cache and call API.")
+            daily_records = []
+        else:
+            for i in range(1, len(dates)):
+                if daily_records[i - 1]["date"] != str(dates[i].date()) if hasattr(dates[i], "date") else str(dates[i]):
+                    print("⚠ Cache date mismatch; will ignore cache and call API.")
+                    daily_records = []
+                    break
+
+    use_cache = len(daily_records) == (len(dates) - 1)
+
+    # —— 回测主循环
+    N = len(dates) - 1
+    for i in range(1, len(dates)):
+        _print_progress(i, N, prefix="LLM")
+
+        day = dates[i]
+        prev_val = portfolio_values[-1]
+        current_prices = {sym: float(prices.iloc[i][sym]) for sym in tickers}
+        day_signals = signals or {}
+
+        if use_cache:
+            # 直接用缓存
+            rec = daily_records[i - 1]
+            trades = rec.get("trades", {})
+            # reasoning = rec.get("reasoning", "")
+        else:
+            # 首次运行：调用 API
+            try:
+                user_date = str(day.date()) if hasattr(day, "date") else str(day)
+                decisions, reasoning = agent.get_trading_decision(
+                    date=user_date,
+                    symbols=tickers,
+                    prices=current_prices,
+                    portfolio=positions,
+                    cash=cash,
+                    signals=day_signals,
+                    market_context=market_ctx or {}
+                )
+                trades = decisions
+                daily_records.append({
+                    "date": user_date,
+                    "trades": trades,
+                    "reasoning": reasoning
+                })
+                time.sleep(sleep_sec)  # 简单限流
+            except Exception as e:
+                print(f"\n[LLM Backtest] API error at {day}: {e} -> HOLD")
+                trades = {}
+
+        # 执行指令
+        pos_before = positions.copy()
+        positions, cash = _apply_trades_llm(current_prices, trades, positions, cash, fee_rate=fee_rate)
+
+        # 成交额与换手
+        traded_amount = 0.0
+        for sym in tickers:
+            delta = abs(positions.get(sym, 0.0) - pos_before.get(sym, 0.0))
+            traded_amount += delta * current_prices[sym]
+
+        # 组合价值
+        new_val = cash + sum(positions.get(sym, 0.0) * current_prices[sym] for sym in tickers)
+        turnover = traded_amount / max(prev_val, 1e-8)
+        cash_ratio = cash / max(new_val, 1e-8)
+
+        portfolio_values.append(new_val)
+        cash_ratios.append(cash_ratio)
+        turnovers.append(turnover)
+        positions_history.append({**{sym: positions.get(sym, 0.0) for sym in tickers}, "cash": cash})
+        actions_history.append({sym: trades.get(sym, {"action": "hold", "shares": 0}) for sym in tickers})
+
+        # 回撤统计
+        if new_val > peak_value:
+            peak_value = new_val
+        dd = (peak_value - new_val) / max(peak_value, 1e-8)
+        drawdown_history.append(dd)
+        if dd > 0.01:
+            dd_in = True; dd_len += 1
+        else:
+            if dd_in:
+                dd_len_max = max(dd_len_max, dd_len)
+                dd_len = 0; dd_in = False
+
+        # 日收益
+        day_ret = (new_val - prev_val) / max(prev_val, 1e-8)
+        returns.append(day_ret)
+
+    # 指标汇总
+    total_return = (portfolio_values[-1] - initial_cash) / initial_cash
+    vol = (np.std(returns) * np.sqrt(252)) if len(returns) > 1 else 0.0
+    mu = np.mean(returns) if returns else 0.0
+    sharpe = (mu / (np.std(returns) + 1e-8) * np.sqrt(252)) if returns else 0.0
+    max_dd = max(drawdown_history) if drawdown_history else 0.0
+    calmar = (total_return / max_dd) if max_dd > 0 else 0.0
+    downs = [r for r in returns if r < 0]
+    dstd = np.std(downs) if downs else 1e-8
+    sortino = (mu / dstd * np.sqrt(252)) if returns else 0.0
+    win_rate = (sum([1 for r in returns if r > 0]) / len(returns)) if returns else 0.0
+    wins = [r for r in returns if r > 0]
+    losses = [abs(r) for r in returns if r < 0]
+    pl_ratio = (np.mean(wins) / np.mean(losses)) if wins and losses else 0.0
+
+    # 集中度
+    concentrations = []
+    for i, pos in enumerate(positions_history):
+        if i >= len(price_df):
+            break
+        total_val = sum([pos.get(t, 0) * float(price_df.iloc[i][t]) for t in tickers if t in pos])
+        if total_val > 0:
+            weights = [pos.get(t, 0) * float(price_df.iloc[i][t]) / total_val for t in tickers if t in pos]
+            hhi = sum([w ** 2 for w in weights])
+            concentrations.append(hhi)
+    avg_conc = float(np.mean(concentrations)) if concentrations else 0.0
+
+    # —— 首次运行才保存缓存
+    if not use_cache:
+        os.makedirs(MODEL_DIR, exist_ok=True)
+        _save_llm_cache(cache_path, cache_meta, daily_records)
+        print(f"\n💾 Saved LLM daily decisions to {cache_path}")
+
+    result = {
+        "agent_name": "LLM Reasoning (GPT-4o)",
+        "final_value": float(portfolio_values[-1]),
+        "total_return": float(total_return),
+        "volatility": float(vol),
+        "sharpe": float(sharpe),
+        "calmar": float(calmar),
+        "sortino": float(sortino),
+        "max_drawdown": float(max_dd),
+        "max_dd_duration": int(dd_len_max),
+        "avg_cash_ratio": float(np.mean(cash_ratios) if cash_ratios else 0.0),
+        "avg_turnover": float(np.mean(turnovers) if turnovers else 0.0),
+        "avg_concentration": float(avg_conc),
+        "win_rate": float(win_rate),
+        "profit_loss_ratio": float(pl_ratio),
+        "portfolio_values": portfolio_values,
+        "returns": returns,
+        "cash_ratios": cash_ratios,
+        "turnovers": turnovers,
+        "positions_history": positions_history,
+        "drawdown_history": drawdown_history,
+        "actions_history": actions_history,
+        "modes_history": None,
+    }
+    return result
 
 
 def main():
@@ -406,10 +676,46 @@ def main():
         results.append(run_backtest("Hierarchical (Adaptive)", hier_net, HierarchicalTradingEnv, close, TEST_TICKERS, model_predict))
     if risk_net and RiskConstrainedEnv:
         results.append(run_backtest("Risk-Constrained (Defensive)", risk_net, RiskConstrainedEnv, close, TEST_TICKERS, model_predict))
+    
+    # ===== Test LLM Reasoning Agent WITH backtest =====
+    print("\n📝 Testing LLM Reasoning Agent...")
+    try:
+        models_dir = os.path.join(os.path.dirname(__file__), "..", "models")
+        if os.path.exists(models_dir):
+            sys.path.insert(0, models_dir)
+            from llm_reasoning_agent import create_llm_agent
 
-    if not results:
-        print("\n❌ No agents were loaded successfully. Please check model files.")
-        return
+            if os.getenv("OPENAI_API_KEY"):
+                llm_agent = create_llm_agent()
+                if llm_agent.test_connection():
+                    print("✓ LLM agent connected. Running backtest (daily decisions)...")
+                    # 可选：降低温度以减少随机性
+                    llm_agent.temperature = 0.2
+
+                    # 可选：传入你已有的 signals / market context
+                    llm_signals = {}
+                    llm_ctx = {"note": "Validation run in script"}
+
+                    llm_result = run_backtest_llm(
+                        agent=llm_agent,
+                        price_df=close,
+                        tickers=TEST_TICKERS,
+                        initial_cash=100000.0,
+                        signals=llm_signals,
+                        market_ctx=llm_ctx,
+                        fee_rate=0.0005,
+                        rpm_limit=60,
+                        sleep_sec=1.0
+                    )
+                    results.append(llm_result)
+                else:
+                    print("⚠ LLM Agent API connection failed; skipping LLM backtest.")
+            else:
+                print("⚠ OPENAI_API_KEY not set; skipping LLM backtest.")
+        else:
+            print("⚠ LLM Agent module not found; skipping LLM backtest.")
+    except Exception as e:
+        print(f"✗ LLM Agent backtest failed: {e}")
 
     print("\n" + "=" * 80)
     print("📊 COMPREHENSIVE COMPARISON RESULTS")
@@ -443,81 +749,117 @@ def main():
               f"{r['profit_loss_ratio']:>10.2f} "
               f"{r['avg_concentration']*100:>13.1f}%")
 
-    # 可视化与保存
+
     try:
+        # —— 统一的色盲友好（Okabe–Ito）调色与样式 —— #
+        PALETTE = {
+            "PPO Planning (Aggressive)":  {"c": "#1F77B4", "ls": "-",  "mk": "o"},  
+            "Hierarchical (Adaptive)":    {"c": "#EEBF6D", "ls": "-", "mk": "s"},  
+            "Risk-Constrained (Defensive)":{"c": "#D94F33", "ls": "-", "mk": "D"}, 
+            "LLM Reasoning (GPT-4o)":     {"c": "#834026", "ls": "-",  "mk": "^"},  
+        }
+        def _sty(name):
+            s = PALETTE.get(name, {"c": "#333333", "ls": "-", "mk": "o"})
+            return s["c"], s["ls"], s["mk"]
+
         fig = plt.figure(figsize=(20, 16))
 
+        # 1) Portfolio Value
         ax = plt.subplot(3, 3, 1)
         for r in results:
-            ax.plot(r['portfolio_values'], label=r['agent_name'], linewidth=2, alpha=0.8)
+            c, ls, mk = _sty(r['agent_name'])
+            ax.plot(r['portfolio_values'], label=r['agent_name'], linewidth=2, alpha=0.9, color=c, linestyle=ls)
         ax.axhline(y=100000, color='black', linestyle='--', alpha=0.5, label='Initial')
         ax.set_xlabel('Trading Day'); ax.set_ylabel('Portfolio Value ($)')
         ax.set_title('Portfolio Value Over Time', fontsize=12, fontweight='bold')
         ax.legend(); ax.grid(True, alpha=0.3)
 
+        # 2) Cumulative Returns
         ax = plt.subplot(3, 3, 2)
         for r in results:
+            c, ls, mk = _sty(r['agent_name'])
             cumulative_returns = [(v - 100000) / 100000 * 100 for v in r['portfolio_values']]
-            ax.plot(cumulative_returns, label=r['agent_name'], linewidth=2, alpha=0.8)
+            ax.plot(cumulative_returns, label=r['agent_name'], linewidth=2, alpha=0.9, color=c, linestyle=ls)
         ax.axhline(y=0, color='black', linestyle='-', alpha=0.5)
         ax.set_xlabel('Trading Day'); ax.set_ylabel('Cumulative Return (%)')
         ax.set_title('Cumulative Returns Comparison', fontsize=12, fontweight='bold')
         ax.legend(); ax.grid(True, alpha=0.3)
 
+        # 3) Drawdown
         ax = plt.subplot(3, 3, 3)
         for r in results:
-            ax.plot([dd*100 for dd in r['drawdown_history']], label=r['agent_name'], linewidth=2, alpha=0.8)
+            c, ls, mk = _sty(r['agent_name'])
+            ax.plot([dd*100 for dd in r['drawdown_history']], label=r['agent_name'], linewidth=2, alpha=0.9, color=c, linestyle=ls)
         ax.set_xlabel('Trading Day'); ax.set_ylabel('Drawdown (%)')
         ax.set_title('Drawdown Over Time', fontsize=12, fontweight='bold')
         ax.legend(); ax.grid(True, alpha=0.3)
         ax.invert_yaxis()
 
+        # 4) Cash Ratio
         ax = plt.subplot(3, 3, 4)
         for r in results:
-            ax.plot([c*100 for c in r['cash_ratios']], label=r['agent_name'], linewidth=2, alpha=0.7)
+            c, ls, mk = _sty(r['agent_name'])
+            ax.plot([csh*100 for csh in r['cash_ratios']], label=r['agent_name'], linewidth=2, alpha=0.85, color=c, linestyle=ls)
         ax.set_xlabel('Trading Day'); ax.set_ylabel('Cash Ratio (%)')
         ax.set_title('Cash Allocation Over Time', fontsize=12, fontweight='bold')
         ax.legend(); ax.grid(True, alpha=0.3)
 
+        # 5) Turnover (5-day MA)
         ax = plt.subplot(3, 3, 5)
         for r in results:
+            c, ls, mk = _sty(r['agent_name'])
             turnover_ma = pd.Series([t*100 for t in r['turnovers']]).rolling(5, min_periods=1).mean()
-            ax.plot(turnover_ma, label=r['agent_name'], linewidth=2, alpha=0.7)
+            ax.plot(turnover_ma, label=r['agent_name'], linewidth=2, alpha=0.85, color=c, linestyle=ls)
         ax.set_xlabel('Trading Day'); ax.set_ylabel('Turnover Rate (%) - 5-day MA')
         ax.set_title('Trading Activity (Smoothed)', fontsize=12, fontweight='bold')
         ax.legend(); ax.grid(True, alpha=0.3)
 
+        # 6) Risk-Return Profile
         ax = plt.subplot(3, 3, 6)
-        colors = ['#ff6b6b', '#4ecdc4', '#45b7d1']
-        for i, r in enumerate(results):
-            color_idx = i % len(colors)
-            ax.scatter(r['volatility']*100, r['total_return']*100,
-                       s=300, alpha=0.7, label=r['agent_name'],
-                       c=colors[color_idx], edgecolors='black', linewidths=2)
+        for r in results:
+            c, ls, mk = _sty(r['agent_name'])
+            ax.scatter(
+                r['volatility']*100, r['total_return']*100,
+                s=260, alpha=0.85, label=r['agent_name'],
+                c=c, edgecolors='black', linewidths=1.2, marker=mk
+            )
         ax.set_xlabel('Volatility (%)'); ax.set_ylabel('Total Return (%)')
         ax.set_title('Risk-Return Profile', fontsize=12, fontweight='bold')
         ax.legend(); ax.grid(True, alpha=0.3)
 
+        # 7) Daily Returns Distribution 
         ax = plt.subplot(3, 3, 7)
         for r in results:
             returns_pct = [ret*100 for ret in r['returns']]
-            ax.hist(returns_pct, bins=30, alpha=0.5, label=r['agent_name'])
+            c, ls, _ = _sty(r['agent_name'])
+            # 绘制线条轮廓和填充
+            ax.hist(
+                returns_pct, bins=30, histtype='step', linewidth=1.8,
+                label=r['agent_name'], color=c, linestyle=ls
+            )
+            ax.hist(
+                returns_pct, bins=30, histtype='stepfilled',
+                alpha=0.12, color=c
+            )
         ax.axvline(x=0, color='black', linestyle='--', alpha=0.5)
         ax.set_xlabel('Daily Return (%)'); ax.set_ylabel('Frequency')
         ax.set_title('Daily Returns Distribution', fontsize=12, fontweight='bold')
         ax.legend(); ax.grid(True, alpha=0.3)
-
+        
+        # 8) Radar
         ax = plt.subplot(3, 3, 8, projection='polar')
         metrics = ['Return', 'Sharpe', 'Calmar', 'Win Rate', 'Stability']
         num_metrics = len(metrics)
         angles = np.linspace(0, 2 * np.pi, num_metrics, endpoint=False).tolist()
         angles += angles[:1]
+
         max_return = max([rr['total_return'] for rr in results]) if results else 1.0
         max_sharpe = max([rr['sharpe'] for rr in results if rr['sharpe'] > 0], default=1.0)
         max_calmar = max([rr['calmar'] for rr in results if rr['calmar'] > 0], default=1.0)
         max_vol = max([rr['volatility'] for rr in results]) if results else 1.0
-        for i, r in enumerate(results):
-            color_idx = i % len(colors)
+
+        for r in results:
+            c, ls, _ = _sty(r['agent_name'])
             values = [
                 r['total_return'] / max_return if max_return > 0 else 0,
                 r['sharpe'] / max_sharpe if max_sharpe > 0 else 0,
@@ -526,32 +868,36 @@ def main():
                 1 - r['volatility'] / max_vol if max_vol > 0 else 0,
             ]
             values += values[:1]
-            ax.plot(angles, values, 'o-', linewidth=2, label=r['agent_name'], color=colors[color_idx], alpha=0.7)
-            ax.fill(angles, values, alpha=0.15, color=colors[color_idx])
+            ax.plot(angles, values, linestyle=ls, linewidth=2.2, label=r['agent_name'], color=c)
+            ax.fill(angles, values, alpha=0.15, color=c)
         ax.set_xticks(angles[:-1]); ax.set_xticklabels(metrics)
         ax.set_ylim(0, 1)
         ax.set_title('Strategy Performance Radar', fontsize=12, fontweight='bold', pad=20)
         ax.legend(loc='upper right', bbox_to_anchor=(1.3, 1.1)); ax.grid(True)
 
+        # 9) Hierarchical pie 或 Key Metrics 柱状
         ax = plt.subplot(3, 3, 9)
         hier_results = [r for r in results if "Hierarchical" in r['agent_name']]
         if hier_results and hier_results[0]['modes_history']:
             modes = hier_results[0]['modes_history']
             mode_names = ['Aggressive', 'Balanced', 'Defensive']
             mode_counts = [modes.count(i) for i in range(3)]
-            colors_pie = ['#ff6b6b', '#4ecdc4', '#45b7d1']
+            # 这里用固定颜色以匹配三种模式的语义（非策略颜色）
+            colors_pie = ['#3B9AB2', '#EDDCC3', '#EEBF6D']
             ax.pie(mode_counts, labels=mode_names, colors=colors_pie, autopct='%1.1f%%', startangle=90)
             ax.set_title('Hierarchical Mode Distribution', fontsize=12, fontweight='bold')
         else:
             metric_names = ['Return', 'Sharpe', 'Calmar']
             x = np.arange(len(metric_names))
-            width = 0.25 if len(results) <= 3 else 0.8 / len(results)
+            n = len(results)
+            width = 0.8 / max(1, n)
             for i, r in enumerate(results):
-                color_idx = i % len(colors)
+                c, ls, mk = _sty(r['agent_name'])
                 values = [r['total_return']*100, r['sharpe'], r['calmar']]
-                ax.bar(x + i*width, values, width, label=r['agent_name'], alpha=0.7, color=colors[color_idx])
+                ax.bar(x + i*width, values, width, label=r['agent_name'],
+                       alpha=0.85, color=c, edgecolor='black', linewidth=0.8)
             ax.set_ylabel('Value'); ax.set_title('Key Metrics Comparison', fontsize=12, fontweight='bold')
-            ax.set_xticks(x + width * (len(results) - 1) / 2); ax.set_xticklabels(metric_names)
+            ax.set_xticks(x + width * (n - 1) / 2); ax.set_xticklabels(metric_names)
             ax.legend(); ax.grid(True, alpha=0.3, axis='y')
 
         plot_path = os.path.join(MODEL_DIR, "agent_comparison_enhanced.png")
@@ -586,6 +932,7 @@ def main():
     print("\n" + "=" * 80)
     print("✅ Enhanced Validation Complete!")
     print("=" * 80)
+
 
 
 if __name__ == "__main__":

@@ -87,23 +87,36 @@ def load_all_model_predictions(tickers: List[str]):
             all_preds[key] = m
     return all_preds
 
-def extract_signals(model_predict, symbols, date_str) -> np.ndarray:
+def _safe_float(x, default=0.0):
+    try:
+        return float(x)
+    except Exception:
+        return default
+def extract_signals(model_predict, symbols, date_str):
     if not isinstance(model_predict, dict):
-        return np.zeros(2 * len(symbols), dtype=np.float32)
-    sigs: List[float] = []
-    for m_name in ["lstm", "xgb"]:
-        m_dict = model_predict.get(m_name, {})
+        return []
+
+    sigs = []
+    for m_key in ("lstm", "xgb"):
+        m_dict = model_predict.get(m_key)
         if not isinstance(m_dict, dict):
             sigs.extend([0.0] * len(symbols))
             continue
+
         for s in symbols:
             v = 0.0
             if s in m_dict:
-                v = float(m_dict[s].get(date_str, 0.0) or 0.0)
+                # 🩵 新增：兼容 "2023-12-05 00:00:00" 键
+                keys = list(m_dict[s].keys())
+                matched_key = None
+                for k in keys:
+                    if date_str in str(k):   # 模糊包含匹配
+                        matched_key = k
+                        break
+                if matched_key:
+                    v = _safe_float(m_dict[s][matched_key], 0.0)
             sigs.append(v)
-    if len(sigs) != 2 * len(symbols):
-        return np.zeros(2 * len(symbols), dtype=np.float32)
-    return np.array(sigs, dtype=np.float32)
+    return sigs
 
 # ==================== 环境 ====================
 

@@ -91,20 +91,28 @@ def load_all_model_predictions(tickers):
     return all_preds
 
 def extract_signals(model_predict, symbols, date_str):
-    """提取信号 [2*n] 维向量: [LSTM对每个股票, XGB对每个股票]"""
     if not isinstance(model_predict, dict):
         return []
 
     sigs = []
-    for m_key in ("lstm", "xgb"):  # 只用2个模型
+    for m_key in ("lstm", "xgb"):
         m_dict = model_predict.get(m_key)
         if not isinstance(m_dict, dict):
             sigs.extend([0.0] * len(symbols))
             continue
+
         for s in symbols:
             v = 0.0
             if s in m_dict:
-                v = _safe_float(m_dict[s].get(date_str, 0.0), 0.0)
+                # 🩵 新增：兼容 "2023-12-05 00:00:00" 键
+                keys = list(m_dict[s].keys())
+                matched_key = None
+                for k in keys:
+                    if date_str in str(k):   # 模糊包含匹配
+                        matched_key = k
+                        break
+                if matched_key:
+                    v = _safe_float(m_dict[s][matched_key], 0.0)
             sigs.append(v)
     return sigs
 
@@ -174,9 +182,20 @@ class MyStrategy:
             return []
 
         portfolio_values = []
+        total_days = len(self.trading_days)
+        
+        # 🔥 添加进度提示
+        print(f"[{self.strategy}] 🚀 开始回测: {total_days} 个交易日")
+        print(f"[{self.strategy}] 📅 从 {self.trading_days[0].strftime('%Y-%m-%d')} 到 {self.trading_days[-1].strftime('%Y-%m-%d')}")
 
         for i, current_date in enumerate(self.trading_days):
+            # 🔥 每天输出进度
+            progress = (i + 1) / total_days * 100
+            date_str = current_date.strftime('%Y-%m-%d')
+            print(f"[{self.strategy}] 📊 Day {i+1}/{total_days} ({progress:.1f}%) - {date_str}", flush=True)
+            
             if i % self.rebalance_interval == 0:
+                print(f"[{self.strategy}] 🔄 执行 rebalance...", flush=True)
                 self.rebalance(current_date)
 
             value = float(
@@ -190,7 +209,10 @@ class MyStrategy:
             portfolio_values.append(
                 {"date": current_date.strftime("%Y-%m-%d"), "value": value}
             )
+            
+            print(f"[{self.strategy}] 💰 Portfolio Value: ${value:,.2f}", flush=True)
 
+        print(f"[{self.strategy}] ✅ 回测完成！", flush=True)
         return portfolio_values
 
     def rebalance(self, current_date):
@@ -607,6 +629,7 @@ def fractional_rebalance(strategy, current_date, target_weights):
     1. 内部使用浮点数持仓 (fractional shares)
     2. 前端显示时才四舍五入
     3. 完全匹配训练环境的行为
+    4. 支持reasoning字段(用于LLM agent)
     """
     prev_balance = (
         strategy.trade_log[-1]["balance"] if strategy.trade_log else strategy.initial_cash
@@ -671,6 +694,7 @@ def fractional_rebalance(strategy, current_date, target_weights):
             # 🔥 portfolio显示用整数,但内部保留浮点数
             "portfolio": {s: round(v) for s, v in strategy.portfolio.items()},
             "change": change,
+            "reasoning": "",  # Will be filled by LLM strategies
         }
     )
 
@@ -754,14 +778,145 @@ class RiskConstrainedStrategy(MyStrategy):
 
 
 class LLMReasoningStrategy(MyStrategy):
+    """
+    LLM-based trading strategy using GPT-4o for decision making.
+    Features Chain-of-Thought reasoning and interpretable trade explanations.
+    """
     def __init__(self, **kwargs):
         super().__init__(strategy_name="LLMReasoning", **kwargs)
+        # Import LLM agent (lazy import to avoid dependency issues)
+        try:
+            import sys
+            import os
+            models_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "..", "models")
+            if models_dir not in sys.path:
+                sys.path.insert(0, models_dir)
+            from llm_reasoning_agent import create_llm_agent
+            self.llm_agent = create_llm_agent()
+            print("[LLMReasoningStrategy] ✓ LLM agent initialized")
+        except Exception as e:
+            print(f"[LLMReasoningStrategy] ⚠️ Failed to load LLM agent: {e}")
+            print("[LLMReasoningStrategy] Falling back to heuristic mode")
+            self.llm_agent = None
 
     def rebalance(self, current_date):
+        """Execute rebalancing with LLM reasoning."""
         date_str = current_date.strftime("%Y-%m-%d")
+        
+        print(f"[LLMReasoning] ⏰ {date_str} - 开始LLM决策...", flush=True)
+        
+        # Extract predictive signals
         signals = extract_signals(self.model_predict, self.symbols, date_str)
-        weights = heuristic_weights_from_signals(self.symbols, signals)
+        
+        # Prepare signal dictionary for LLM
+        signal_dict = {}
+        if signals and len(signals) >= 2 * len(self.symbols):
+            signal_dict["lstm"] = {
+                s: float(signals[i]) for i, s in enumerate(self.symbols)
+            }
+            signal_dict["xgb"] = {
+                s: float(signals[len(self.symbols) + i]) for i, s in enumerate(self.symbols)
+            }
+        
+        print(f"[LLMReasoning] 📈 信号: LSTM={signal_dict.get('lstm', {})}", flush=True)
+        
+        # Get current prices
+        prices = {
+            s: float(self.data_open.loc[current_date, s]) for s in self.symbols
+        }
+        
+        print(f"[LLMReasoning] 💵 价格: {prices}", flush=True)
+        
+        # Calculate current portfolio state
+        prev_balance = (
+            self.trade_log[-1]["balance"] if self.trade_log else self.initial_cash
+        )
+        
+        reasoning = "Using fallback heuristic strategy."  # Default
+        
+        # Try to get LLM decision
+        if self.llm_agent is not None:
+            try:
+                print(f"[LLMReasoning] 🤖 调用 GPT-4o API...", flush=True)
+                import time
+                start_time = time.time()
+                
+                # Get LLM trading decision with reasoning
+                trades, reasoning = self.llm_agent.get_trading_decision(
+                    date=date_str,
+                    symbols=self.symbols,
+                    prices=prices,
+                    portfolio=self.portfolio.copy(),
+                    cash=float(self.cash),
+                    signals=signal_dict
+                )
+                
+                elapsed = time.time() - start_time
+                print(f"[LLMReasoning] ✅ LLM响应成功 (耗时: {elapsed:.2f}s)", flush=True)
+                print(f"[LLMReasoning] 💡 决策: {trades}", flush=True)
+                print(f"[LLMReasoning] 📝 理由: {reasoning}", flush=True)
+                
+                # Convert LLM trades to target weights
+                total_value = float(self.cash)
+                for s in self.symbols:
+                    total_value += self.portfolio.get(s, 0) * prices[s]
+                
+                weights = []
+                for symbol in self.symbols:
+                    trade = trades.get(symbol, {"action": "hold", "shares": 0})
+                    action = trade["action"]
+                    shares = trade["shares"]
+                    
+                    if action == "buy":
+                        # Increase position
+                        current_shares = self.portfolio.get(symbol, 0)
+                        target_shares = current_shares + shares
+                    elif action == "sell":
+                        # Decrease position
+                        current_shares = self.portfolio.get(symbol, 0)
+                        target_shares = max(0, current_shares - shares)
+                    else:  # hold
+                        target_shares = self.portfolio.get(symbol, 0)
+                    
+                    target_value = target_shares * prices[symbol]
+                    weight = target_value / total_value if total_value > 0 else 0
+                    weights.append(weight)
+                
+                # Add cash weight
+                cash_weight = max(0, 1.0 - sum(weights))
+                weights.append(cash_weight)
+                weights = np.array(weights, dtype=np.float32)
+                
+                # Normalize weights
+                if weights.sum() > 0:
+                    weights = weights / weights.sum()
+                else:
+                    # Fallback to heuristic
+                    weights = heuristic_weights_from_signals(self.symbols, signals)
+                    reasoning = "LLM returned invalid weights, using fallback heuristic."
+                    
+            except Exception as e:
+                print(f"[LLMReasoningStrategy] Error in LLM decision: {e}")
+                weights = heuristic_weights_from_signals(self.symbols, signals)
+                reasoning = f"LLM error: {str(e)[:100]}. Using fallback heuristic."
+        else:
+            # Fallback to heuristic if LLM not available
+            weights = heuristic_weights_from_signals(self.symbols, signals)
+        
+        # Execute rebalancing
+        prev_port = self.portfolio.copy()
         fractional_rebalance(self, current_date, weights)
+        
+        # Add reasoning to the last trade log entry
+        if self.trade_log:
+            # Truncate reasoning if too long
+            if len(reasoning) > 500:
+                reasoning = reasoning[:497] + "..."
+            self.trade_log[-1]["reasoning"] = reasoning
+            
+            # Also add earnings_per_stock for consistency
+            if "earnings_per_stock" not in self.trade_log[-1]:
+                self.trade_log[-1]["earnings_per_stock"] = {}
 
 
 # =========================
@@ -897,6 +1052,7 @@ def get_trade_log():
         "earnings_per_stock": trade_log.earnings_per_stock,
         "model": trade_log.model,
         "game_id": trade_log.game_id,
+        "reasoning": trade_log.reasoning or "",
     })
 
 def run_agent_for_game_and_save(game_id, tickers, start_date, end_date,
@@ -992,6 +1148,7 @@ def run_agent_for_game_and_save(game_id, tickers, start_date, end_date,
                 existing.change = entry.get("change", existing.change)
                 existing.earnings_per_stock = entry.get(
                     "earnings_per_stock", existing.earnings_per_stock)
+                existing.reasoning = entry.get("reasoning", existing.reasoning or "")
             else:
                 rec = TradeLog(
                     date=date,
@@ -1002,6 +1159,7 @@ def run_agent_for_game_and_save(game_id, tickers, start_date, end_date,
                     earnings_per_stock=entry.get("earnings_per_stock", {}),
                     model=model_name,
                     game_id=game_id,
+                    reasoning=entry.get("reasoning", ""),
                 )
                 db.session.add(rec)
 
