@@ -930,6 +930,247 @@ def main():
     summary_df.to_csv(csv_path, index=False)
     print(f"\n💾 Saved detailed summary to {csv_path}")
     print("\n" + "=" * 80)
+
+    # ===== Extra diagnostics: behaviour-level evidence that agents differ =====
+    try:
+        os.makedirs(MODEL_DIR, exist_ok=True)
+
+        # ---------- 1) Daily return correlation matrix ----------
+        import numpy as np
+        import matplotlib.pyplot as plt
+
+        agent_names = [r["agent_name"] for r in results]
+        # 对齐长度，避免因为 LLM agent 天数略有差异而报错
+        min_len = min(len(r["returns"]) for r in results if len(r["returns"]) > 0)
+        ret_mat = np.array([np.array(r["returns"][:min_len]) for r in results])
+        corr = np.corrcoef(ret_mat)
+
+        print("\n📌 Daily return correlation matrix:")
+        header = " " * 18 + " ".join([f"{name[:10]:>10}" for name in agent_names])
+        print(header)
+        for i, name in enumerate(agent_names):
+            row = " ".join([f"{corr[i, j]:>10.3f}" for j in range(len(agent_names))])
+            print(f"{name[:16]:>16} {row}")
+
+        fig_corr, ax_corr = plt.subplots(figsize=(6, 5))
+        im = ax_corr.imshow(corr, vmin=-1, vmax=1, cmap="coolwarm")
+        ax_corr.set_xticks(range(len(agent_names)))
+        ax_corr.set_yticks(range(len(agent_names)))
+        ax_corr.set_xticklabels([n.replace(" (", "\n(") for n in agent_names], rotation=45, ha="right")
+        ax_corr.set_yticklabels(agent_names)
+        ax_corr.set_title("Daily Return Correlation", fontsize=12, fontweight="bold")
+        fig_corr.colorbar(im, ax=ax_corr, label="Correlation")
+        corr_path = os.path.join(MODEL_DIR, "agent_return_correlation.png")
+        fig_corr.tight_layout()
+        fig_corr.savefig(corr_path, dpi=150, bbox_inches="tight")
+        plt.close(fig_corr)
+        print(f"✓ Saved correlation heatmap to {corr_path}")
+
+        # ---------- 2) Average portfolio weights (AAPL/MSFT/GOOGL/CASH) ----------
+        assets = list(TEST_TICKERS) + ["CASH"]
+        avg_weights_per_agent = []
+
+        for r in results:
+            pos_hist = r.get("positions_history", [])
+            if not pos_hist:
+                # LLM 或异常情况，也跳过
+                avg_weights_per_agent.append([0.0] * len(assets))
+                continue
+
+            w_sum = np.zeros(len(assets), dtype=float)
+            count = 0
+            for i, pos in enumerate(pos_hist):
+                if i >= len(close):
+                    break
+                prices_row = close.iloc[i]
+                equity_val = sum(pos.get(t, 0.0) * float(prices_row[t]) for t in TEST_TICKERS)
+                cash_val = float(pos.get("cash", 0.0))
+                total_val = equity_val + cash_val
+                if total_val <= 0:
+                    continue
+
+                w_vec = []
+                for t in TEST_TICKERS:
+                    w_vec.append(pos.get(t, 0.0) * float(prices_row[t]) / total_val)
+                w_vec.append(cash_val / total_val)  # CASH
+                w_sum += np.array(w_vec)
+                count += 1
+
+            if count > 0:
+                avg_w = (w_sum / count).tolist()
+            else:
+                avg_w = [0.0] * len(assets)
+            avg_weights_per_agent.append(avg_w)
+
+        fig_wavg, ax_wavg = plt.subplots(figsize=(10, 6))
+        x = np.arange(len(assets))
+        width = 0.15
+        for i, (name, w_vec) in enumerate(zip(agent_names, avg_weights_per_agent)):
+            offset = (i - (len(agent_names) - 1) / 2) * width
+            ax_wavg.bar(x + offset, np.array(w_vec) * 100.0,
+                        width=width, label=name, alpha=0.85)
+        ax_wavg.set_xticks(x)
+        ax_wavg.set_xticklabels(assets)
+        ax_wavg.set_ylabel("Average Portfolio Weight (%)")
+        ax_wavg.set_title("Average Asset/Cash Allocation by Agent", fontsize=12, fontweight="bold")
+        ax_wavg.legend()
+        ax_wavg.grid(True, alpha=0.3, axis="y")
+        wavg_path = os.path.join(MODEL_DIR, "agent_avg_weights.png")
+        fig_wavg.tight_layout()
+        fig_wavg.savefig(wavg_path, dpi=150, bbox_inches="tight")
+        plt.close(fig_wavg)
+        print(f"✓ Saved average weights bar chart to {wavg_path}")
+
+        # ---------- 3) Per-agent weight heatmap over time ----------
+        def _safe_name(name: str) -> str:
+            s = name.lower()
+            for ch in " /()":
+                s = s.replace(ch, "_")
+            return s
+
+        for r in results:
+            pos_hist = r.get("positions_history", [])
+            if not pos_hist:
+                continue
+
+            weights_over_time = []
+            for i, pos in enumerate(pos_hist):
+                if i >= len(close):
+                    break
+                prices_row = close.iloc[i]
+                equity_val = sum(pos.get(t, 0.0) * float(prices_row[t]) for t in TEST_TICKERS)
+                cash_val = float(pos.get("cash", 0.0))
+                total_val = equity_val + cash_val
+                if total_val <= 0:
+                    weights_over_time.append([0.0] * len(assets))
+                    continue
+                w_vec = []
+                for t in TEST_TICKERS:
+                    w_vec.append(pos.get(t, 0.0) * float(prices_row[t]) / total_val)
+                w_vec.append(cash_val / total_val)
+                weights_over_time.append(w_vec)
+
+            if not weights_over_time:
+                continue
+
+            W = np.array(weights_over_time).T  # shape: [n_assets, T]
+            fig_h, ax_h = plt.subplots(figsize=(12, 3.5))
+            im = ax_h.imshow(W, aspect="auto", origin="lower", vmin=0, vmax=1, cmap="viridis")
+            ax_h.set_yticks(range(len(assets)))
+            ax_h.set_yticklabels(assets)
+            ax_h.set_xlabel("Trading Day (index)")
+            ax_h.set_title(f"Portfolio Weights Over Time - {r['agent_name']}",
+                           fontsize=11, fontweight="bold")
+            cbar = fig_h.colorbar(im, ax=ax_h)
+            cbar.set_label("Weight")
+            heat_path = os.path.join(MODEL_DIR, f"{_safe_name(r['agent_name'])}_weights_heatmap.png")
+            fig_h.tight_layout()
+            fig_h.savefig(heat_path, dpi=150, bbox_inches="tight")
+            plt.close(fig_h)
+            print(f"✓ Saved weight heatmap for {r['agent_name']} to {heat_path}")
+
+        # ---------- 4) Hierarchical modes over time ----------
+        for r in results:
+            modes = r.get("modes_history")
+            if modes is None or len(modes) == 0:
+                continue
+            fig_m, ax_m = plt.subplots(figsize=(10, 2.8))
+            ax_m.step(range(len(modes)), modes, where="mid")
+            ax_m.set_xlabel("Trading Day")
+            ax_m.set_ylabel("Mode index")
+            ax_m.set_yticks([0, 1, 2])
+            ax_m.set_yticklabels(["Aggressive", "Balanced", "Defensive"])
+            ax_m.set_title("Hierarchical Agent Mode Over Time",
+                           fontsize=12, fontweight="bold")
+            ax_m.grid(True, alpha=0.3, axis="x")
+            mode_path = os.path.join(MODEL_DIR, "hierarchical_modes_over_time.png")
+            fig_m.tight_layout()
+            fig_m.savefig(mode_path, dpi=150, bbox_inches="tight")
+            plt.close(fig_m)
+            print(f"✓ Saved hierarchical mode timeline to {mode_path}")
+
+        print("✅ Extra diagnostics generated.")
+    except Exception as e:
+        print(f"(extra diagnostics skipped) Error: {e}") 
+
+    # ---------- 5) Action probability heatmaps (per agent, partial window) ----------
+    # 截取的时间窗口（按 step index，而不是具体日期）
+    # 可以改成 (0, 60)、(90, 150) 等
+    SLICE_START = 0
+    SLICE_END = 250   # 例如只看前 60 天，避免图太挤不清晰
+
+    # 如果上面没有定义过 _safe_name，可以解除下面注释：
+    # def _safe_name(name: str) -> str:
+    #     s = name.lower()
+    #     for ch in " /()":
+    #         s = s.replace(ch, "_")
+    #     return s
+
+    assets = list(TEST_TICKERS) + ["CASH"]
+
+    for r in results:
+        acts = r.get("actions_history", None)
+        if acts is None or len(acts) == 0:
+            continue  # LLM agent 若未记录 actions，会被跳过
+
+        A = np.array(acts)  # shape: [T, action_dim]
+        if A.ndim != 2:
+            continue
+
+        T, D = A.shape
+        # 安全截取时间窗口
+        s = max(0, SLICE_START)
+        e = min(T, SLICE_END)
+        if e - s < 5:
+            print(f"Skipping action heatmap for {r['agent_name']} (too few steps in slice {s}-{e})")
+            continue
+
+        A = A[s:e]  # 仅保留该时间段的 action 轨迹，shape: [T_slice, D]
+
+        # 维度对齐到 len(assets)（多的截掉，不足补 0）
+        if D > len(assets):
+            A = A[:, :len(assets)]
+        elif D < len(assets):
+            pad = np.zeros((A.shape[0], len(assets) - D))
+            A = np.concatenate([A, pad], axis=1)
+
+        # 剪裁到 [0,1] 区间，避免异常值
+        A = np.clip(A, 0.0, 1.0)
+
+        # 使用分位数自适应色阶，提高对比度
+        vmin = float(np.percentile(A, 5))
+        vmax = float(np.percentile(A, 95))
+        if vmax - vmin < 1e-6:  # 避免几乎常数矩阵导致显示全一种颜色
+            vmin, vmax = float(A.min()), float(A.max())
+        if vmax - vmin < 1e-6:  # 还是几乎常数，就退回默认 0-1
+            vmin, vmax = 0.0, 1.0
+
+        fig_act, ax_act = plt.subplots(figsize=(10, 2.8))
+        im = ax_act.imshow(
+            A.T,
+            aspect="auto",
+            origin="lower",
+            vmin=vmin,
+            vmax=vmax,
+            cmap="magma"  # 和权重 heatmap 区分开
+        )
+        ax_act.set_yticks(range(len(assets)))
+        ax_act.set_yticklabels(assets)
+        ax_act.set_xlabel(f"Trading Day (index, {s}–{e})")
+        ax_act.set_title(
+            f"Action Probabilities (Segment) - {r['agent_name']}",
+            fontsize=11, fontweight="bold"
+        )
+        fig_act.colorbar(im, ax=ax_act, label="Action Probability")
+
+        action_path = os.path.join(
+            MODEL_DIR,
+            f"{_safe_name(r['agent_name'])}_action_heatmap_{s}_{e}.png"
+        )
+        fig_act.tight_layout()
+        fig_act.savefig(action_path, dpi=150, bbox_inches="tight")
+        plt.close(fig_act)
+        print(f"✓ Saved segmented action heatmap for {r['agent_name']} to {action_path}")
     print("✅ Enhanced Validation Complete!")
     print("=" * 80)
 

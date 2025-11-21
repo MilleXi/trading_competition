@@ -6,7 +6,16 @@ Welcome to Trading Wars, an innovative and engaging platform where artificial in
 
 ## Key Features
 
-- **AI Opponents**: Choose from three sophisticated AI models: LSTM, XGBoost, and LightGBM, each employing unique trading strategies.
+- **AI Opponents (4 Trading Personalities)**  
+  Battle against four distinct AI agents, each representing a different decision paradigm:
+  - **PPO Planning (Aggressive)** – reward-seeking RL agent with high conviction and low cash usage  
+  - **Hierarchical RL (Adaptive)** – switches between aggressive/balanced/defensive modes based on market regimes  
+  - **Risk-Constrained RL (Defensive)** – emphasizes capital preservation, controlled drawdowns, and higher cash buffers  
+  - **LLM Reasoning Agent (Rational)** – GPT-based agent that trades via natural-language reasoning and produces human-readable explanations each round 
+   
+- **Predictive Signals**  
+  Short-horizon price forecasts from **LSTM** and **XGBoost** models are provided as signals for both human players and AI agents, helping everyone form expectations about future market movements.
+
 - **Starting Capital**: Begin with a capital of $100,000.
 - **Stock Selection**: Select three stocks from a list of 30 to focus on throughout the game.
 - **10 Rounds**: The game is structured into 10 rounds, each representing a single trading day.
@@ -21,7 +30,8 @@ Welcome to Trading Wars, an innovative and engaging platform where artificial in
 
 Watch the demo video below to see how to play the game:
 
-[Watch the video](https://youtu.be/E7QLd853hZ0)
+[Watch the Trading War 1.0 video](https://youtu.be/E7QLd853hZ0)
+[Watch the Trading War 2.0 video](https://youtu.be/Bs1eKTpq0C8)
 
 ## Game Tips
 
@@ -41,8 +51,8 @@ Watch the demo video below to see how to play the game:
 ### Clone the Project
 
 ```bash
-git clone https://github.com/MilleXi/trading_competition_platform.git
-cd trading_competition_platform
+git clone https://github.com/MilleXi/trading_competition.git
+cd trading_competition
 ```
 
 ### Setup Virtual Environment and Install Dependencies
@@ -93,6 +103,6 @@ Their dedication and hard work have been instrumental in bringing this project t
 If you have any questions or suggestions, please feel free to contact us:
 
 - Email: xyy318@126.com
-- GitHub Issues: [GitHub Issues](https://github.com/MilleXi/trading_competition_platform/issues)
+- GitHub Issues: [GitHub Issues](https://github.com/MilleXi/trading_competition/issues)
 
 Thank you for your participation and support!
