@@ -31,6 +31,7 @@ Welcome to Trading Wars, an innovative and engaging platform where artificial in
 Watch the demo video below to see how to play the game:
 
 [Watch the Trading War 1.0 video](https://youtu.be/E7QLd853hZ0)
+
 [Watch the Trading War 2.0 video](https://youtu.be/Bs1eKTpq0C8)
 
 ## Game Tips
